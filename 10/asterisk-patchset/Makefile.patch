@@ -1,0 +1,19 @@
+--- asterisk/Makefile.orig	2012-10-19 01:53:08.000000000 +0600
++++ asterisk/Makefile	2013-03-14 22:26:57.000000000 +0600
+@@ -836,13 +836,13 @@
+ 	fi
+ 
+ cmenuselect: menuselect/cmenuselect menuselect-tree menuselect.makeopts
+-	-@menuselect/cmenuselect menuselect.makeopts && (echo "menuselect changes saved!"; rm -f channels/h323/Makefile.ast main/asterisk) || echo "menuselect changes NOT saved!"
++	-@menuselect/cmenuselect menuselect.makeopts && (echo "menuselect changes saved!"; rm -f main/asterisk) || echo "menuselect changes NOT saved!"
+ 
+ gmenuselect: menuselect/gmenuselect menuselect-tree menuselect.makeopts
+-	-@menuselect/gmenuselect menuselect.makeopts && (echo "menuselect changes saved!"; rm -f channels/h323/Makefile.ast main/asterisk) || echo "menuselect changes NOT saved!"
++	-@menuselect/gmenuselect menuselect.makeopts && (echo "menuselect changes saved!"; rm -f main/asterisk) || echo "menuselect changes NOT saved!"
+ 
+ nmenuselect: menuselect/nmenuselect menuselect-tree menuselect.makeopts
+-	-@menuselect/nmenuselect menuselect.makeopts && (echo "menuselect changes saved!"; rm -f channels/h323/Makefile.ast main/asterisk) || echo "menuselect changes NOT saved!"
++	-@menuselect/nmenuselect menuselect.makeopts && (echo "menuselect changes saved!"; rm -f main/asterisk) || echo "menuselect changes NOT saved!"
+ 
+ # options for make in menuselect/
+ MAKE_MENUSELECT=CC="$(BUILD_CC)" CXX="" LD="" AR="" RANLIB="" CFLAGS="" $(MAKE) -C menuselect CONFIGURE_SILENT="--silent"

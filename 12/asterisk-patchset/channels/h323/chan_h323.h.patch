@@ -1,0 +1,87 @@
+--- asterisk/channels/h323/chan_h323.h.orig	2013-12-19 22:37:56.000000000 +0600
++++ asterisk/channels/h323/chan_h323.h	2014-03-17 15:16:58.814067115 +0600
+@@ -32,6 +32,17 @@
+ #include <arpa/inet.h>
+ #include "asterisk/format.h"
+ #include "asterisk/app.h"
++#ifdef __cplusplus
++extern "C" {
++#endif
++#include <asterisk.h>
++#include <asterisk/frame.h>
++#include <asterisk/udptl.h>
++#include <asterisk/astobj.h>
++#ifdef __cplusplus
++}
++#endif
++
+ 
+ /*
+  * Enable support for sending/reception of tunnelled Q.SIG messages and
+@@ -50,6 +61,12 @@
+ 
+ typedef int64_t h323_format;
+ 
++enum h323_udptl_ec_modes {
++    UDPTL_EC_AUTO = 0,
++    UDPTL_EC_FEC,
++    UDPTL_EC_REDUNDANCY
++};
++
+ /** call_option struct holds various bits
+  *         of information for each call */
+ typedef struct call_options {
+@@ -71,6 +88,9 @@
+ 	h323_format     capability;
+ 	int				bridge;
+ 	int				nat;
++	int				t38pt_udptl;
++	enum h323_udptl_ec_modes	t38pt_udptl_ec;
++	unsigned			t38pt_udptl_max_datagram;
+ 	int				tunnelOptions;
+ 	int				holdHandling;
+ 	int				autoframing; /*!< turn on to override local settings with remote framing length */
+@@ -145,6 +165,7 @@
+    the external RTP port from Asterisk. */
+ typedef rtp_info_t *(*on_rtp_cb)(unsigned, const char *);
+ extern on_rtp_cb on_external_rtp_create;
++extern on_rtp_cb on_external_udptl_create;
+ 
+ /* This is a callback prototype function, called to send
+    the remote IP and RTP port from H.323 to Asterisk */
+@@ -219,6 +240,12 @@
+ extern "C" {
+ #endif
+ 
++struct t38_profile {
++	struct ast_control_t38_parameters ast;
++	enum ast_t38_ec_modes error_correction_scheme;
++	int max_datagram;
++};
++
+ 	void h323_gk_urq(void);
+ 	void h323_end_point_create(void);
+ 	void h323_end_process(void);
+@@ -240,9 +267,8 @@
+ 					rfc2833_cb,
+ 					hangup_cb,
+ 					setcapabilities_cb,
+-					setpeercapabilities_cb,
+ 					onhold_cb);
+-	int h323_set_capabilities(const char *, int, int, struct ast_codec_pref *, int);
++	int h323_set_capabilities(const char *, int, int, struct ast_codec_pref *, int, struct t38_profile*);
+ 	int h323_set_alias(struct oh323_alias *);
+ 	int h323_set_gk(int, char *, char *);
+ 	void h323_set_id(char *);
+@@ -269,6 +295,11 @@
+ 	int h323_show_codec(int fd, int argc, char *argv[]);
+ 	int h323_hold_call(const char *token, int);
+ 
++int external_udptl_create(unsigned call_reference, const char * token, struct in_addr them, struct rtp_info *info);
++int setup_udptl_connection(unsigned call_reference, const char *token, const struct sockaddr_in *them);
++int request_mode_change(unsigned call_reference, const char *token, struct t38_profile *profile);
++int h323_request_mode_change(const char *token, const struct t38_profile *profile);
++int set_peer_capabilities(unsigned call_reference, const char *token, int capabilities, struct ast_codec_pref *prefs, const struct t38_profile *profile);
+ #ifdef __cplusplus
+ }
+ #endif

@@ -1,0 +1,44 @@
+--- asterisk/channels/h323/caps_h323.h.orig	2009-02-19 01:11:57.000000000 +0500
++++ asterisk/channels/h323/caps_h323.h	2013-03-14 22:26:57.000000000 +0600
+@@ -1,6 +1,8 @@
+ #ifndef __AST_H323CAPS_H
+ #define __AST_H323CAPS_H
+ 
++#include <h323t38.h>
++
+ /**This class describes the G.711 codec capability.
+  */
+ class AST_G711Capability : public H323AudioCapability
+@@ -169,4 +171,32 @@
+ 	}
+ };
+ 
++/* T.38 Caps */
++class AST_T38Capability : public H323_T38Capability
++{
++	PCLASSINFO(AST_T38Capability, H323_T38Capability);
++	/* for TerminalCapabilitySet or OpenLogicalChannel PDU */
++	PBoolean OnSendingPDU(H245_DataApplicationCapability & pdu) const;
++	/* for RequestMode PDU */
++	PBoolean OnSendingPDU(H245_DataMode & pdu) const;
++	PBoolean OnReceivedPDU(const H245_DataApplicationCapability & cap);
++
++	H245_T38FaxProfile m_profile;
++	int m_bit_rate;
++
++public:
++	AST_T38Capability(const struct t38_profile*);
++	PObject *Clone() const;
++   
++	/* Create the channel instance, allocating resources as required. */
++	H323Channel *CreateChannel(H323Connection &connection,
++				   H323Channel::Directions, unsigned sessionID,
++				   const H245_H2250LogicalChannelParameters *param) const;
++
++	void SetProfile(const struct t38_profile*);
++	void GetProfile(struct t38_profile*) const;
++	/* received RequestMode from peer, inherit T.38 profile */
++	PBoolean OnReceivedPDU(const H245_DataMode & pdu);
++};
++
+ #endif /* __AST_H323CAPS_H */

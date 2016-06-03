@@ -1,0 +1,80 @@
+--- asterisk/channels/Makefile.in.orig	2013-03-14 22:26:57.000000000 +0600
++++ asterisk/channels/Makefile.in	2013-03-14 22:28:13.000000000 +0600
+@@ -0,0 +1,77 @@
++#
++# Asterisk -- A telephony toolkit for Linux.
++# 
++# Makefile for channel drivers
++#
++# Copyright (C) 1999-2006, Digium, Inc.
++#
++# This program is free software, distributed under the terms of
++# the GNU General Public License
++#
++
++-include $(ASTTOPDIR)/menuselect.makeopts $(ASTTOPDIR)/menuselect.makedeps
++
++MODULE_PREFIX=chan
++MENUSELECT_CATEGORY=CHANNELS
++MENUSELECT_DESCRIPTION=Channel Drivers
++
++ifeq ($(wildcard h323/libchanh323.a),)
++  MODULE_EXCLUDE += chan_h323
++endif
++
++all: _all
++
++include $(ASTTOPDIR)/Makefile.moddir_rules
++
++ifneq ($(findstring $(OSARCH), mingw32 cygwin ),)
++  LIBS+= -lres_monitor.so -lres_features.so
++endif
++
++clean::
++	$(MAKE) -C misdn clean
++	rm -f sip/*.o sip/*.i
++	gmake -C h323 clean
++
++dist-clean::
++	gmake -C h323 dist-clean
++	rm -f Makefile
++
++$(if $(filter chan_iax2,$(EMBEDDED_MODS)),modules.link,chan_iax2.so): iax2-parser.o iax2-provision.o
++iax2-parser.o iax2-provision.o: _ASTCFLAGS+=$(call MOD_ASTCFLAGS,chan_iax2)
++$(if $(filter chan_sip,$(EMBEDDED_MODS)),modules.link,chan_sip.so): $(subst .c,.o,$(wildcard sip/*.c))
++$(subst .c,.o,$(wildcard sip/*.c)): _ASTCFLAGS+=$(call MOD_ASTCFLAGS,chan_sip)
++$(if $(filter chan_dahdi,$(EMBEDDED_MODS)),modules.link,chan_dahdi.so): sig_analog.o sig_pri.o sig_ss7.o
++sig_analog.o sig_pri.o sig_ss7.o: _ASTCFLAGS+=$(call MOD_ASTCFLAGS,chan_dahdi)
++
++ifneq ($(filter chan_h323,$(EMBEDDED_MODS)),)
++modules.link: h323/libchanh323.a
++else
++chan_h323.so: h323/libchanh323.a
++chan_h323.so: H323CFLAGS = $(shell cat h323/Makefile.CFLAGS)
++chan_h323.so: H323LDFLAGS = $(shell cat h323/Makefile.LDFLAGS)
++chan_h323.so: H323LDLIBS = $(shell cat h323/Makefile.LDLIBS)
++chan_h323.so: chan_h323.o
++	$(ECHO_PREFIX) echo "   [LD] $^ -> $@"
++	$(ECHO_PREFIX) echo "$(CMD_PREFIX) $(CXX) $(PTHREAD_CFLAGS) $(_ASTLDFLAGS) $(ASTLDFLAGS) $(SOLINK) $(H323CFLAGS) $(H323LDFLAGS) $(H323LDLIBS) -o $@ $< h323/libchanh323.a"
++	$(CMD_PREFIX) $(CXX) $(PTHREAD_CFLAGS) $(_ASTLDFLAGS) $(ASTLDFLAGS) $(SOLINK) $(H323CFLAGS) $(H323LDFLAGS) $(H323LDLIBS) -o $@ $< h323/libchanh323.a
++endif
++
++h323/libchanh323.a:
++	$(CMD_PREFIX) $(MAKE) -C h323 @OPENH323_BUILD@
++
++chan_misdn.o: _ASTCFLAGS+=-Imisdn
++
++misdn_config.o: _ASTCFLAGS+=-Imisdn
++
++misdn/isdn_lib.o: _ASTCFLAGS+=-Wno-strict-aliasing
++
++$(if $(filter chan_misdn,$(EMBEDDED_MODS)),modules.link,chan_misdn.so): misdn_config.o misdn/isdn_lib.o misdn/isdn_msg_parser.o
++misdn_config.o misdn/isdn_lib.o misdn/isdn_msg_parser.o: _ASTCFLAGS+=$(call MOD_ASTCFLAGS,chan_misdn)
++
++$(if $(filter chan_oss,$(EMBEDDED_MODS)),modules.link,chan_oss.so): console_video.o vgrabbers.o console_board.o
++console_video.o vgrabbers.o console_board.o: _ASTCFLAGS+=$(call MOD_ASTCFLAGS,chan_oss)
++
++chan_usbradio.o: ./xpmr/xpmr.c ./xpmr/xpmr.h ./xpmr/xpmr_coef.h
++
++chan_usbradio.so: LIBS+=-lusb -lasound
++chan_usbradio.so: _ASTCFLAGS+=-DNDEBUG

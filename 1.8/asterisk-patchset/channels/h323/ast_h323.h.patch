@@ -1,0 +1,130 @@
+--- asterisk/channels/h323/ast_h323.h.orig	2009-03-18 01:47:31.000000000 +0500
++++ asterisk/channels/h323/ast_h323.h	2013-03-14 16:32:12.000000000 +0600
+@@ -30,16 +30,20 @@
+ #define AST_H323_H
+ 
+ #include "ast_ptlib.h"
++#include <t38proto.h>
++#include <h323t38.h>
++#include <q931.h>
+ 
+ #define VERSION(a,b,c) ((a)*10000+(b)*100+(c))
+ 
+ class MyH323EndPoint : public H323EndPoint
+ {
+ 	PCLASSINFO(MyH323EndPoint, H323EndPoint);
++	OpalT38Protocol * CreateT38ProtocolHandler(const H323Connection & connection) const;
+ 
+ public:
+ 	MyH323EndPoint();
+-	int MyMakeCall(const PString &, PString &, void *_callReference, void *_opts);
++	int MyMakeCall(const PString &, struct call_details*, struct call_options*);
+ 	PBoolean ClearCall(const PString &, H323Connection::CallEndReason reason);
+ 	PBoolean ClearCall(const PString &);
+ 
+@@ -58,7 +62,19 @@
+ class MyH323Connection : public H323Connection
+ {
+ 	PCLASSINFO(MyH323Connection, H323Connection);
+-
++	void OnRefusedModeChange(const H245_RequestModeReject *pdu);
++	void OnAcceptModeChange(const H245_RequestModeAck & pdu);
++	PBoolean OnRequestModeChange(const H245_RequestMode & pdu,
++                            	 H245_RequestModeAck & ack,
++                            	 H245_RequestModeReject & reject,
++                            	 PINDEX & selectedMode);
++	void OnModeChanged(PBoolean ok);
++	void CleanUpOnCallEnd();
++	
++	PBoolean m_modeChangedOk;
++	PSyncPoint m_modeChanged;
++	PMutex m_modeChangeMutex;
++	
+ public:
+ 	MyH323Connection(MyH323EndPoint &, unsigned, unsigned);
+ 	~MyH323Connection();
+@@ -71,6 +87,7 @@
+ 			const H323SignalPDU &,
+ 			H323SignalPDU &);
+ 	void OnReceivedReleaseComplete(const H323SignalPDU &);
++	PBoolean IsFastStartDisabled() { return fastStartState == FastStartDisabled; }
+ 	PBoolean OnAlerting(const H323SignalPDU &, const PString &);
+ 	PBoolean OnSendReleaseComplete(H323SignalPDU &);
+ 	PBoolean OnReceivedSignalSetup(const H323SignalPDU &);
+@@ -85,7 +102,7 @@
+ 	PBoolean MySendProgress();
+ 	void OnSendCapabilitySet(H245_TerminalCapabilitySet &);
+ 	void OnSetLocalCapabilities();
+-	void SetCapabilities(int, int, void *, int);
++	void SetCapabilities(int, int, void *, int, struct t38_profile*);
+ 	PBoolean OnReceivedCapabilitySet(const H323Capabilities &, const H245_MultiplexCapability *,
+ 			H245_TerminalCapabilitySetReject &);
+ 	void SetCause(int _cause) { cause = _cause; };
+@@ -101,7 +118,11 @@
+ 	virtual void OnReceivedLocalCallHold(int linkedId);
+ 	virtual void OnReceivedLocalCallRetrieve(int linkedId);
+ #endif
+-	void MyHoldCall(BOOL localHold);
++	const H323Capability *GetPreferredAudioCapability() const;
++	void MyHoldCall(PBoolean localHold);
++
++	static Q931::InformationTransferCapability Q931InformationTransferCapability(unsigned short);
++	static unsigned short AstTransferCapability(Q931::InformationTransferCapability);
+ 
+ 	PString sourceAliases;
+ 	PString destAliases;
+@@ -111,7 +132,11 @@
+ 	int cid_ton;
+ 	PString rdnis;
+ 	int redirect_reason;
+-	int transfer_capability;
++
++	Q931::InformationTransferCapability transferCapability;
++	unsigned transferRate;
++	unsigned codingStandard;
++	unsigned userInfoLayer1;
+ 
+ 	WORD sessionId;
+ 	PBoolean bridging;
+@@ -134,6 +159,7 @@
+ 	PCLASSINFO(MyH323_ExternalRTPChannel, H323_ExternalRTPChannel);
+ 
+ public:
++	struct RTPChannelCreationError {};	// exception (d.kochmashev@gmail.com)
+ 	MyH323_ExternalRTPChannel(
+ 			MyH323Connection & connection,
+ 			const H323Capability & capability,
+@@ -153,15 +179,30 @@
+ 	PIPSocket::Address remoteIpAddr;
+ 	/* Additional functions in order to have chan_h323 compile with H323Plus */
+ #if VERSION(OPENH323_MAJOR, OPENH323_MINOR, OPENH323_BUILD) > VERSION(1,19,4)
+-	BOOL OnReceivedAltPDU(const H245_ArrayOf_GenericInformation & alternate );
+-	BOOL OnSendingAltPDU(H245_ArrayOf_GenericInformation & alternate) const;
++	PBoolean OnReceivedAltPDU(const H245_ArrayOf_GenericInformation & alternate );
++	PBoolean OnSendingAltPDU(H245_ArrayOf_GenericInformation & alternate) const;
+ 	void OnSendOpenAckAlt(H245_ArrayOf_GenericInformation & alternate) const;
+-	BOOL OnReceivedAckAltPDU(const H245_ArrayOf_GenericInformation & alternate);
++	PBoolean OnReceivedAckAltPDU(const H245_ArrayOf_GenericInformation & alternate);
+ #endif
+ 	WORD localPort;
+ 	WORD remotePort;
+ };
+ 
++struct MyT38Channel : public H323_T38Channel
++{
++	MyT38Channel(H323Connection & connection,        ///< Connection to endpoint for channel
++    		     const H323Capability & capability,  ///< Capability channel is using
++            	     Directions direction,               ///< Direction of channel
++                     unsigned sessionID);                ///< Session ID for channel
++
++private:                
++	PBoolean Start();
++	Directions GetDirection() const;
++	PBoolean CreateListener();
++	void Receive();
++	void Transmit();
++};
++
+ #ifdef H323_H450
+ 
+ #if VERSION(OPENH323_MAJOR, OPENH323_MINOR, OPENH323_BUILD) > VERSION(1,19,4)

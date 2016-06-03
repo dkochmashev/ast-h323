@@ -1,0 +1,10 @@
+--- asterisk/main/editline/np/strlcpy.c.orig	2010-07-28 04:30:38.000000000 +0600
++++ asterisk/main/editline/np/strlcpy.c	2013-03-14 16:32:12.000000000 +0600
+@@ -28,6 +28,7 @@
+  */
+ 
+ #include "config.h"
++#include "sys.h"
+ #if defined(LIBC_SCCS) && !defined(lint)
+ #if 0
+ static char *rcsid = "$OpenBSD: strlcpy.c,v 1.4 1999/05/01 18:56:41 millert Exp $";

@@ -1,0 +1,72 @@
+--- SPECS/asterisk11.spec.orig	2014-11-21 02:02:35.000000000 +0300
++++ SPECS/asterisk11.spec	2014-12-31 08:37:11.837530042 +0300
+@@ -6,7 +6,7 @@
+ Summary: Asterisk, The Open Source PBX
+ Name: asterisk11
+ Version: 11.14.1
+-Release: 1%{dist}%{?_without_optimizations:_debug}
++Release: 1%{dist}.1.39.h323%{?_without_optimizations:_debug}
+ License: GPL
+ Group: Utilities/System
+ Source: asterisk-%{version}.tar.gz
+@@ -22,6 +22,7 @@
+ Patch9: 0001-create_channels_at_run-time.patch
+ Patch10: 0001-lazymembers.patch
+ Patch12: rb3477-japanese-localization.patch
++Patch13: ast-h323.patch
+ BuildRoot: %{_tmppath}/%{name}-%{version}-root
+ URL: http://www.asterisk.org
+ Vendor: Schmooze Com, Inc.
+@@ -107,6 +108,7 @@
+ Requires: openssl
+ Requires: libxml2
+ BuildRequires: libwat-devel
++AutoReqProv: no
+ 
+ %description core
+ This package contains a base install of Asterisk without any "extras".
+@@ -602,6 +604,7 @@
+ %patch9 -p1
+ %patch10 -p1 -F2
+ %patch12 -p2
++%patch13 -p1
+ 
+ %build
+ %ifarch x86_64
+@@ -613,7 +616,7 @@
+ 
+ # bootstrap after adding libwat (yes it's needed)
+ ./bootstrap.sh
+-./configure --libdir=%{_libdir}
++./configure --libdir=%{_libdir} --with-h323=%{?_without_optimizations:debug}%{!?_without_optimizations:opt}
+ make menuselect.makeopts
+ #menuselect/menuselect --list-options to get the options passed below
+ menuselect/menuselect --disable-category MENUSELECT_CORE_SOUNDS --disable-category MENUSELECT_EXTRA_SOUNDS --disable-category MENUSELECT_MOH --enable-category MENUSELECT_ADDONS --enable res_pktccops --enable chan_mgcp --enable chan_motif --enable app_dahdibarge --enable app_meetme --enable app_page --enable res_mwi_blf --enable res_snmp --enable res_srtp --enable DONT_OPTIMIZE --disable BUILD_NATIVE
+@@ -761,6 +764,7 @@
+ %{_libdir}/asterisk/modules/chan_skinny.so
+ %{_libdir}/asterisk/modules/chan_sip.so
+ %{_libdir}/asterisk/modules/chan_unistim.so
++%{_libdir}/asterisk/modules/chan_h323.so
+ %{_libdir}/asterisk/modules/codec_adpcm.so
+ %{_libdir}/asterisk/modules/codec_alaw.so
+ %{_libdir}/asterisk/modules/codec_a_mu.so
+--- SPECS/flite.spec.orig	2014-11-21 02:11:19.000000000 +0300
++++ SPECS/flite.spec	2015-01-12 10:02:21.811652239 +0300
+@@ -34,7 +34,7 @@
+ %endif
+ 
+ %ifarch x86_64
+-mkdir -p %{buildroot}/usr/lib/asterisk/modules/
++mkdir -p %{buildroot}%{_libdir}/asterisk/modules/
+ %endif
+ mkdir -p %{buildroot}%{_sysconfdir}/asterisk/
+ make DESTDIR=$RPM_BUILD_ROOT install
+@@ -52,7 +52,7 @@
+ %files
+ %defattr(-,asterisk,asterisk,-)
+ %ifarch x86_64
+-/usr/lib/asterisk/modules/app_flite.so
++%{_libdir}/asterisk/modules/app_flite.so
+ %endif
+ %ifarch i386 i586 i686 
+ %{_libdir}/asterisk/modules/app_flite.so

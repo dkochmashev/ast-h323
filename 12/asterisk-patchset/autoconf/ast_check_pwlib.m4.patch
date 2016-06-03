@@ -1,0 +1,11 @@
+--- asterisk/autoconf/ast_check_pwlib.m4.orig	2013-01-29 08:12:04.000000000 +0600
++++ asterisk/autoconf/ast_check_pwlib.m4	2014-03-17 15:16:58.884063210 +0600
+@@ -198,7 +198,7 @@
+ 	fi
+ 
+ 	if test "${HAS_$2:-unset}" != "unset"; then
+-		$2_VERSION=`grep "$VNAME \"" ${$2_INCDIR}/$3 | sed -e 's/[[[:space:]]]\{1,\}/ /g' | cut -f3 -d ' ' | sed -e 's/"//g'`
++		$2_VERSION=`grep "$VNAME" ${$2_INCDIR}/$3 | sed -e 's/[[[:space:]]]\{1,\}/ /g' | cut -f3 -d ' ' | sed -e 's/"//g'`
+ 		$2_MAJOR_VERSION=`echo ${$2_VERSION} | cut -f1 -d.`
+ 		$2_MINOR_VERSION=`echo ${$2_VERSION} | cut -f2 -d.`
+ 		$2_BUILD_NUMBER=`echo ${$2_VERSION} | cut -f3 -d.`

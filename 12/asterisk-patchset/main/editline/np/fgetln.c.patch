@@ -1,0 +1,10 @@
+--- asterisk/main/editline/np/fgetln.c.orig	2006-08-21 08:11:39.000000000 +0600
++++ asterisk/main/editline/np/fgetln.c	2014-03-17 15:16:58.764069905 +0600
+@@ -37,6 +37,7 @@
+  */
+ 
+ #include "config.h"
++#include "sys.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <unistd.h>

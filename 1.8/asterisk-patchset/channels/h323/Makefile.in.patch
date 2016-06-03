@@ -1,0 +1,74 @@
+--- asterisk/channels/h323/Makefile.in.orig	2010-06-03 20:48:09.000000000 +0600
++++ asterisk/channels/h323/Makefile.in	2013-03-14 19:06:02.000000000 +0600
+@@ -4,50 +4,35 @@
+ # Make file for OpenH323 support layer
+ #
+ 
+-.PHONY: Makefile.ast clean
++.PHONY:		Makefile.ast
+ 
+-default::	@OPENH323_BUILD@
+-
+-# Verify those options with main Makefile
+-STDCCFLAGS	= -DNDEBUG
+-STDCCFLAGS	+= -I../../include -include ../../include/asterisk/autoconfig.h
+-STDCCFLAGS	+= -fPIC
+-#OPTCCFLAGS	+=
+-CFLAGS		= -pipe
+-TARGET		= libchanh323.a
+-TARGET		+= Makefile.ast
+-SOURCES		= ast_h323.cxx compat_h323.cxx cisco-h225.cxx caps_h323.cxx
+-OBJDIR		= .
+-OBJS		=
+-
+-ifndef OPENH323DIR
+-OPENH323DIR=@OPENH323DIR@
++ifndef PWLIBDIR
++PWLIBDIR	= @PWLIB_DIR@
++PTLIBDIR	= $(PWLIBDIR)
+ endif
+ 
+-ifneq ($(wildcard $(OPENH323DIR)/openh323u.mak),)
+-include $(OPENH323DIR)/openh323u.mak
++ifndef OPENH323DIR
++OPENH323DIR	= @H323_DIR@
+ endif
+ 
+-notrace::
+-	$(MAKE) NOTRACE=1 opt
++STDCCFLAGS	+= -I../../include -include ../../include/asterisk/autoconfig.h
++CFLAGS		= -pipe -fexceptions
++SOURCES		:= ast_h323.cxx compat_h323.cxx cisco-h225.cxx caps_h323.cxx
++TARGET		:= libchanh323.a
+ 
+-$(SOURCES)::	Makefile ../../Makefile
+-	touch $@
++include $(OPENH323DIR)/openh323u.mak
+ 
++$(shell echo $(STDCCFLAGS) $(OPTCCFLAGS) $(CFLAGS) >Makefile.CFLAGS)
++$(shell echo $(CFLAGS) $(LDFLAGS) >Makefile.LDFLAGS)
++$(shell echo $(LDLIBS) $(ENDLDLIBS) $(ENDLDFLAGS) >Makefile.LDLIBS)
++                        
+ libchanh323.a:	$(OBJS)
+ 	ar crv $@ $(OBJS)
+ 
+-# 
+-# We have this file in svn, so this is commented out to ensure it doesn't try
+-# to run implicitly.  However, it's still here for reference.
+-#
+-#cisco-h225.cxx::	cisco-h225.asn
+-#	asnparser -m CISCO_H225 -c $<
+-
+-Makefile.ast:
+-	@echo H323CFLAGS  = $(STDCCFLAGS) $(OPTCCFLAGS) $(CFLAGS) >$@.tmp
+-	@echo H323LDFLAGS = $(CFLAGS) $(LDFLAGS) >>$@.tmp
+-	@echo H323LDLIBS  = $(LDLIBS) $(ENDLDLIBS) $(ENDLDFLAGS) >>$@.tmp
+-	@if [ -r $@ ] && cmp -s $@ $@.tmp; then rm -f $@.tmp; else mv -f $@.tmp $@; fi
+-
+ clean::
++	rm -vf libchanh323.a
++	rm -vf Makefile.*FLAGS
++	rm -vf Makefile.LDLIBS
++
++dist-clean::
++	rm -vf Makefile

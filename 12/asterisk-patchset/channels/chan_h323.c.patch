@@ -1,0 +1,751 @@
+--- asterisk/channels/chan_h323.c.orig	2013-12-19 22:37:56.000000000 +0600
++++ asterisk/channels/chan_h323.c	2014-03-17 22:41:09.855065001 +0600
+@@ -29,7 +29,7 @@
+  *
+  * \par See also
+  * \arg Config_h323
+- * OpenH323 http://www.voxgratia.org/
++ * H.323+ http://www.h323plus.org
+  *
+  * \ingroup channel_drivers
+  */
+@@ -44,9 +44,7 @@
+ 
+ /*** MODULEINFO
+ 	<depend>openh323</depend>
+-	<defaultenabled>no</defaultenabled>
+-	<support_level>deprecated</support_level>
+-	<replacement>chan_ooh323</replacement>
++	<defaultenabled>yes</defaultenabled>
+  ***/
+ 
+ #ifdef __cplusplus
+@@ -87,6 +85,7 @@
+ #include "asterisk/sched.h"
+ #include "asterisk/io.h"
+ #include "asterisk/rtp_engine.h"
++#include "asterisk/udptl.h"
+ #include "asterisk/acl.h"
+ #include "asterisk/callerid.h"
+ #include "asterisk/cli.h"
+@@ -119,7 +118,6 @@
+ rfc2833_cb on_set_rfc2833_payload;
+ hangup_cb on_hangup;
+ setcapabilities_cb on_setcapabilities;
+-setpeercapabilities_cb on_setpeercapabilities;
+ onhold_cb on_hold;
+ 
+ int h323debug; /*!< global debug flag */
+@@ -137,7 +135,7 @@
+ static struct ast_jb_conf global_jbconf;
+ 
+ /** Variables required by Asterisk */
+-static const char tdesc[] = "The NuFone Network's Open H.323 Channel Driver";
++static const char tdesc[] = "H.323+ channel driver";
+ static const char config[] = "h323.conf";
+ static char default_context[AST_MAX_CONTEXT] = "default";
+ static struct sockaddr_in bindaddr;
+@@ -184,6 +182,7 @@
+ 	char rdnis[80];				/*!< Referring DNIS, if available */
+ 	int amaflags;				/*!< AMA Flags */
+ 	struct ast_rtp_instance *rtp;		/*!< RTP Session */
++	struct ast_udptl *udptl;
+ 	struct ast_dsp *vad;			/*!< Used for in-band DTMF detection */
+ 	int nativeformats;			/*!< Codec formats supported by a channel */
+ 	int needhangup;				/*!< Send hangup when Asterisk is ready */
+@@ -205,6 +204,7 @@
+ 	int noInbandDtmf;			/*!< Inband DTMF processing by DSP isn't available */
+ 	int connection_established;		/*!< Call got CONNECT message */
+ 	int got_progress;			/*!< Call got PROGRESS message, pass inband audio */
++	enum ast_t38_state t38state;
+ 	struct oh323_pvt *next;			/*!< Next channel in list */
+ } *iflist = NULL;
+ 
+@@ -470,6 +470,11 @@
+ 		ast_rtp_instance_destroy(pvt->rtp);
+ 	}
+ 
++	/* Destroy UDPTL session if exists (d.kochmashev@gmail.com) */
++	if (pvt->udptl) {
++		ast_udptl_destroy(pvt->udptl);
++	}
++
+ 	/* Free dsp used for in-band DTMF detection */
+ 	if (pvt->vad) {
+ 		ast_dsp_free(pvt->vad);
+@@ -599,7 +604,7 @@
+ static int oh323_call(struct ast_channel *c, const char *dest, int timeout)
+ {
+ 	int res = 0;
+-	struct oh323_pvt *pvt = (struct oh323_pvt *)ast_channel_tech_pvt(c);
++	struct oh323_pvt *pvt = (struct oh323_pvt *) ast_channel_tech_pvt(c);
+ 	const char *addr;
+ 	char called_addr[1024];
+ 
+@@ -826,7 +831,7 @@
+ static struct ast_frame *oh323_read(struct ast_channel *c)
+ {
+ 	struct ast_frame *fr;
+-	struct oh323_pvt *pvt = (struct oh323_pvt *)ast_channel_tech_pvt(c);
++	struct oh323_pvt *pvt = (struct oh323_pvt *) ast_channel_tech_pvt(c);
+ 	ast_mutex_lock(&pvt->lock);
+ 	__oh323_update_info(c, pvt);
+ 	switch(ast_channel_fdno(c)) {
+@@ -839,6 +844,12 @@
+ 		else
+ 			fr = &ast_null_frame;
+ 		break;
++        case 4:
++		if (pvt->udptl)
++			fr = ast_udptl_read(pvt->udptl);   /* UDPTL for T.38 */
++		else
++			fr = &ast_null_frame;
++		break;
+ 	default:
+ 		ast_log(LOG_ERROR, "Unable to handle fd %d on channel %s\n", ast_channel_fdno(c), ast_channel_name(c));
+ 		fr = &ast_null_frame;
+@@ -855,6 +866,15 @@
+ 	if (frame->frametype != AST_FRAME_VOICE) {
+ 		if (frame->frametype == AST_FRAME_IMAGE) {
+ 			return 0;
++		} else if (frame->frametype == AST_FRAME_MODEM) {
++            		if (pvt) {
++                    		ast_mutex_lock(&pvt->lock);
++                    		if (pvt->udptl &&
++                        	    (pvt->t38state == T38_STATE_NEGOTIATED))
++                            		res = ast_udptl_write(pvt->udptl, frame);
++                    		ast_mutex_unlock(&pvt->lock);
++				return res;
++			}
+ 		} else {
+ 			ast_log(LOG_WARNING, "Can't send %d type frames with H323 write\n", frame->frametype);
+ 			return 0;
+@@ -880,6 +900,120 @@
+ 	return res;
+ }
+ 
++static int handle_t38_control(struct oh323_pvt *pvt, const struct ast_control_t38_parameters *parameters, const char *token)
++{
++	int res = -1;
++	ast_mutex_lock(&pvt->lock);
++
++	switch (parameters->request_response) {
++	case AST_T38_REQUEST_NEGOTIATE:
++		if (pvt->t38state == T38_STATE_UNKNOWN) {
++			enum ast_t38_state old_state = pvt->t38state;
++			struct t38_profile profile;
++
++			ast_udptl_set_local_max_ifp(pvt->udptl, parameters->max_ifp);
++			profile.ast = *parameters;
++			profile.max_datagram = ast_udptl_get_local_max_datagram(pvt->udptl);
++			profile.error_correction_scheme = ast_udptl_get_error_correction_scheme(pvt->udptl);
++
++			pvt->t38state = T38_STATE_NEGOTIATING; /* callback can happen very quickly, therefore switch 
++								* to negotiating state right now, while pvt is under lock
++								*/
++			ast_mutex_unlock(&pvt->lock);
++			res = h323_request_mode_change(token, &profile);
++			ast_mutex_lock(&pvt->lock);
++
++			if (res != 0)
++				pvt->t38state = old_state;
++		} else if (pvt->t38state == T38_STATE_NEGOTIATED) {
++			/* already negotiated, send confirmation to bridged peer immediately */
++			struct ast_control_t38_parameters parameters = { .request_response = AST_T38_NEGOTIATED };
++			res = ast_queue_control_data(pvt->owner, AST_CONTROL_T38_PARAMETERS, &parameters, sizeof(parameters));
++		} else if (pvt->t38state == T38_STATE_UNAVAILABLE) {
++			struct ast_control_t38_parameters parameters = { .request_response = AST_T38_REFUSED };
++			res = ast_queue_control_data(pvt->owner, AST_CONTROL_T38_PARAMETERS, &parameters, sizeof(parameters));
++		}
++		break;
++	case AST_T38_REQUEST_TERMINATE:
++		/* bridged peer requests to terminate T38 session */
++		if (pvt->t38state == T38_STATE_NEGOTIATED || pvt->t38state == T38_STATE_NEGOTIATING) {
++			struct t38_profile profile;
++			profile.ast = *parameters;
++
++			pvt->t38state = T38_STATE_NEGOTIATING; /* callback can happen very quickly, therefore switch 
++								* to negotiating state right now, while pvt is under lock
++								*/
++			ast_mutex_unlock(&pvt->lock);
++			res = h323_request_mode_change(token, &profile);
++			ast_mutex_lock(&pvt->lock);
++
++			if (res != 0)
++				/* failed to request change to audio mode */
++				pvt->t38state = pvt->t38state;
++		} else  {
++			/* already not active, send confirmation to bridged peer immediately */
++			struct ast_control_t38_parameters parameters = { .request_response = AST_T38_TERMINATED };
++			res = ast_queue_control_data(pvt->owner, AST_CONTROL_T38_PARAMETERS, &parameters, sizeof(parameters));
++		}
++		break;
++	case AST_T38_REFUSED:
++		/* bridged peer indicates that he has refused to start T38 session */
++		if (pvt->t38state == T38_STATE_NEGOTIATING) {
++			struct t38_profile profile;
++			profile.ast = *parameters;
++			pvt->t38state = T38_STATE_UNKNOWN;
++
++			ast_mutex_unlock(&pvt->lock);
++			res = h323_request_mode_change(token, &profile);
++			ast_mutex_lock(&pvt->lock);
++		}
++		break;
++	case AST_T38_TERMINATED:
++		/* bridged peer indicates that he has terminated T38 session */
++		if (pvt->t38state == T38_STATE_NEGOTIATED || pvt->t38state == T38_STATE_NEGOTIATING) {
++			struct t38_profile profile;
++			profile.ast = *parameters;
++			if (pvt->t38state == T38_STATE_NEGOTIATED)
++				/* AST_T38_TERMINATED sent to us without request from our side.
++				 * This is a bug in bridged channel, but we will handle this anyway
++				 * by re-defining request.
++				 */
++				profile.ast.request_response = AST_T38_REQUEST_TERMINATE;
++			else
++				/* we got ack for our AST_T38_REQUEST_TERMINATE */
++				pvt->t38state = T38_STATE_UNKNOWN;
++
++			ast_mutex_unlock(&pvt->lock);
++			res = h323_request_mode_change(token, &profile);
++			ast_mutex_lock(&pvt->lock);
++		}
++		break;
++	case AST_T38_NEGOTIATED:
++		if (pvt->t38state == T38_STATE_NEGOTIATING) {
++			struct t38_profile profile;
++
++			ast_udptl_set_local_max_ifp(pvt->udptl, parameters->max_ifp);
++			profile.ast = *parameters;
++			profile.max_datagram = ast_udptl_get_local_max_datagram(pvt->udptl);
++			profile.error_correction_scheme = ast_udptl_get_error_correction_scheme(pvt->udptl);
++
++			ast_mutex_unlock(&pvt->lock);
++			res = h323_request_mode_change(token, &profile);
++			ast_mutex_lock(&pvt->lock);
++
++			/* state will be changed when T.38 channel will
++			 * be started in openh323
++			 */
++		}
++		break;
++	default:
++    		break;
++	}
++	
++	ast_mutex_unlock(&pvt->lock);
++	return res;
++}
++
+ static int oh323_indicate(struct ast_channel *c, int condition, const void *data, size_t datalen)
+ {
+ 
+@@ -888,6 +1022,9 @@
+ 	int res = -1;
+ 	int got_progress;
+ 
++	if (!pvt)
++		return -1;
++	
+ 	ast_mutex_lock(&pvt->lock);
+ 	token = (pvt->cd.call_token ? ast_strdup(pvt->cd.call_token) : NULL);
+ 	got_progress = pvt->got_progress;
+@@ -956,6 +1093,14 @@
+ 	case AST_CONTROL_PVT_CAUSE_CODE:
+ 	case -1:
+ 		break;
++	case AST_CONTROL_T38_PARAMETERS:
++		if (datalen != sizeof(struct ast_control_t38_parameters))
++			ast_log(LOG_ERROR, "Invalid datalen for AST_CONTROL_T38. "
++                                           "Expected %d, got %d\n",
++                            		   (int)sizeof(enum ast_control_t38), (int)datalen);
++		else
++			res = handle_t38_control(pvt, data, token);
++            	break;
+ 	default:
+ 		ast_log(LOG_WARNING, "OH323: Don't know how to indicate condition %d on %s\n", condition, token);
+ 		break;
+@@ -993,7 +1138,7 @@
+ 
+ 	{
+ 		struct ast_sockaddr tmp;
+-
++		tmp.ss.ss_family = AF_INET;
+ 		ast_sockaddr_from_sin(&tmp, &bindaddr);
+ 		if (ast_find_ourip(&our_addr, &tmp, AF_INET)) {
+ 			ast_mutex_unlock(&pvt->lock);
+@@ -1038,6 +1183,43 @@
+ 	return 0;
+ }
+ 
++static int __oh323_udptl_create(struct oh323_pvt *pvt)
++{
++	struct ast_sockaddr tmp;
++
++	if (pvt->udptl)
++		return 0;
++
++	tmp.ss.ss_family = AF_INET;
++	ast_sockaddr_from_sin(&tmp, &bindaddr);
++	pvt->udptl = ast_udptl_new_with_bindaddr(sched, io, 0, &tmp);
++	if (!pvt->udptl) {
++		/* t38pt_udptl is configured, but we failed to create UDPTL session,
++		 * this is error
++		 */
++		ast_log(LOG_WARNING, "Unable to create UDPTL session: %s\n", strerror(errno));
++		return -1;
++	}
++	pvt->t38state = T38_STATE_UNKNOWN; /* t38pt_udptl is enabled, but no fax negotiations have been done yet */
++
++	switch (pvt->options.t38pt_udptl_ec) {
++	case UDPTL_EC_FEC:
++		ast_udptl_set_error_correction_scheme(pvt->udptl, UDPTL_ERROR_CORRECTION_FEC);
++		break;
++	case UDPTL_EC_REDUNDANCY:
++		ast_udptl_set_error_correction_scheme(pvt->udptl, UDPTL_ERROR_CORRECTION_REDUNDANCY);
++		break;
++	default:
++		break;
++	}
++
++	ast_udptl_setnat(pvt->udptl, pvt->options.nat);
++
++	ast_udptl_setqos(pvt->udptl, tos, cos);
++	
++	return 0;
++}
++
+ /*! \brief Private structure should be locked on a call */
+ static struct ast_channel *__oh323_new(struct oh323_pvt *pvt, int state, const char *host, const char *linkedid)
+ {
+@@ -1090,11 +1272,15 @@
+ 			ast_channel_set_fd(ch, 3, ast_rtp_instance_fd(pvt->vrtp, 1));
+ 		}
+ #endif
+-#ifdef T38_SUPPORT
++		if (pvt->options.t38pt_udptl && __oh323_udptl_create(pvt)) {
++			ast_hangup(ch);
++			return NULL;
++		}
++
+ 		if (pvt->udptl) {
+ 			ast_channel_set_fd(ch, 4, ast_udptl_fd(pvt->udptl));
+ 		}
+-#endif
++
+ 		if (state == AST_STATE_RING) {
+ 			ast_channel_rings_set(ch, 1);
+ 		}
+@@ -1171,7 +1357,13 @@
+ 		}
+ 		if (!pvt->cd.call_token) {
+ 			ast_log(LOG_ERROR, "Not enough memory to alocate call token\n");
+-			ast_rtp_instance_destroy(pvt->rtp);
++			/* Destroy RTP and UDPTL sessions if exist (d.kochmashev@gmail.com) */
++			if (pvt->rtp) {
++				ast_rtp_instance_destroy(pvt->rtp);
++			}
++			if (pvt->udptl) {
++				ast_udptl_destroy(pvt->udptl);
++			}
+ 			ast_free(pvt);
+ 			return NULL;
+ 		}
+@@ -1187,6 +1379,7 @@
+ 	}
+ 	ast_copy_string(pvt->context, default_context, sizeof(pvt->context));
+ 	pvt->newstate = pvt->newcontrol = pvt->newdigit = pvt->update_rtp_info = pvt->DTMFsched = -1;
++	pvt->t38state = T38_STATE_UNAVAILABLE; /* we don't know if t38pt_udptl is enabled in peer/user */
+ 	ast_mutex_init(&pvt->lock);
+ 	/* Add to interface list */
+ 	ast_mutex_lock(&iflock);
+@@ -1230,6 +1423,47 @@
+ 	return NULL;
+ }
+ 
++int external_udptl_create(unsigned call_reference, const char * token, struct in_addr them, struct rtp_info *info)
++{
++	struct oh323_pvt *pvt;
++	struct sockaddr_in us;
++	struct ast_sockaddr tmp;
++
++	pvt = find_call_locked(call_reference, token);
++	if (!pvt) {
++		ast_log(LOG_ERROR, "Unable to find call %s(%d)\n", token, call_reference);
++		return -1;
++	}
++	if (!pvt->udptl) {
++		/* Strange, if this function if invoked, UDPTL should - it means we have provided T.38 capability
++		 * and UDPTL should be created
++		 */
++		ast_log(LOG_ERROR, "No UDPTL for call %s(%d)\n", token, call_reference);
++		ast_mutex_unlock(&pvt->lock);
++		return -1;
++	}
++
++	/* figure out our local RTP port and tell the H.323 stack about it */
++	ast_udptl_get_us(pvt->udptl, &tmp);
++	ast_sockaddr_to_sin(&tmp, &us);
++	ast_mutex_unlock(&pvt->lock);
++
++	if (!us.sin_addr.s_addr) { // 0.0.0.0
++		struct ast_sockaddr t;
++		struct sockaddr_in them_s;
++		them_s.sin_addr = them;
++		ast_sockaddr_from_sin(&t, &them_s);
++		ast_ouraddrfor(&t, &tmp);
++		ast_sockaddr_to_sin(&tmp, &us);
++	}
++
++	ast_copy_string(info->addr, ast_inet_ntoa(us.sin_addr), sizeof(info->addr));
++	info->port = ntohs(us.sin_port);
++	if (h323debug)
++		ast_debug(1, "Sending UDPTL 'US' %s:%d\n", info->addr, info->port);
++	return 0;
++}
++
+ static int update_state(struct oh323_pvt *pvt, int state, int signal)
+ {
+ 	if (!pvt)
+@@ -1390,14 +1624,26 @@
+ 		options->silenceSuppression = ast_true(v->value);
+ 	} else if (!strcasecmp(v->name, "progress_setup")) {
+ 		tmp = atoi(v->value);
+-		if ((tmp != 0) && (tmp != 1) && (tmp != 3) && (tmp != 8)) {
++
++		// Allowed values of Progress Description are:
++		// 0 - don't set Progress Description
++		// 1-5,8 - set Progress Description to this value
++		// d.kochmashev@gmail.com
++
++		if (tmp < 0 || tmp == 6 || tmp == 7 || tmp > 8) {
+ 			ast_log(LOG_WARNING, "Invalid value %s for %s at line %d, assuming 0\n", v->value, v->name, v->lineno);
+ 			tmp = 0;
+ 		}
+ 		options->progress_setup = tmp;
+ 	} else if (!strcasecmp(v->name, "progress_alert")) {
+ 		tmp = atoi(v->value);
+-		if ((tmp != 0) && (tmp != 1) && (tmp != 8)) {
++
++		// Allowed values of Progress Description are:
++		// 0 - don't set Progress Description
++		// 1-5,8 - set Progress Description to this value
++		// d.kochmashev@gmail.com
++
++		if (tmp < 0 || tmp == 6 || tmp == 7 || tmp > 8) {
+ 			ast_log(LOG_WARNING, "Invalid value %s for %s at line %d, assuming 0\n", v->value, v->name, v->lineno);
+ 			tmp = 0;
+ 		}
+@@ -1419,6 +1665,19 @@
+ 			options->tunnelOptions |= H323_TUNNEL_QSIG;
+ 		else
+ 			ast_log(LOG_WARNING, "Invalid value %s for %s at line %d\n", v->value, v->name, v->lineno);
++	} else if (!strcasecmp(v->name, "t38pt_udptl")) {
++		options->t38pt_udptl = ast_true(v->value);
++	} else if (!strcasecmp(v->name, "t38pt_udptl_ec")) {
++		if (!strcasecmp(v->value, "auto"))
++		    options->t38pt_udptl_ec = UDPTL_EC_AUTO;
++		else if (!strcasecmp(v->value, "fec"))
++		    options->t38pt_udptl_ec = UDPTL_EC_FEC;
++		else if (!strcasecmp(v->value, "redundancy"))
++		    options->t38pt_udptl_ec = UDPTL_EC_REDUNDANCY;
++		else
++		    ast_log(LOG_WARNING, "Invalid value %s for %s at line %d\n", v->value, v->name, v->lineno);
++	} else if (!strcasecmp(v->name, "t38pt_udptl_max_datagram")) {
++		options->t38pt_udptl_max_datagram = atoi(v->value);
+ 	} else if (!strcasecmp(v->name, "hold")) {
+ 		if (!strcasecmp(v->value, "none"))
+ 			options->holdHandling = ~0;
+@@ -1486,8 +1745,8 @@
+ 				return NULL;
+ 			} else {
+ 				struct ast_sockaddr tmp;
+-
+ 				tmp.ss.ss_family = AF_INET;
++
+ 				if (ast_get_ip(&tmp, v->value)) {
+ 					ASTOBJ_UNREF(user, oh323_destroy_user);
+ 					return NULL;
+@@ -1606,8 +1865,8 @@
+ 			}
+ 			{
+ 				struct ast_sockaddr tmp;
+-
+ 				tmp.ss.ss_family = AF_INET;
++
+ 				if (ast_get_ip(&tmp, v->value)) {
+ 					ast_log(LOG_ERROR, "Could not determine IP for %s\n", v->value);
+ 					ASTOBJ_UNREF(peer, oh323_destroy_peer);
+@@ -2152,6 +2411,129 @@
+ 	return;
+ }
+ 
++int setup_udptl_connection(unsigned call_reference, const char *token, const struct sockaddr_in *them)
++{
++	struct oh323_pvt *p;
++	struct ast_sockaddr tmp;
++
++	if (h323debug)
++		ast_debug(1, "Setting up UDPTL connection for %s\n", token);
++
++	/* Find the call or allocate a private structure if call not found */
++	p = find_call_locked(call_reference, token);
++	if (!p) {
++		ast_log(LOG_ERROR, "Something is wrong: udptl\n");
++		return -1;
++	}
++	if (!p->udptl) {
++		ast_log(LOG_ERROR, "No UDPTL for call %s(%d)\n", token, call_reference);
++		ast_mutex_unlock(&p->lock);
++		return -1;
++	}
++
++	ast_sockaddr_from_sin(&tmp, them);
++	ast_udptl_set_peer(p->udptl, &tmp);
++
++	ast_mutex_unlock(&p->lock);
++
++	if (h323debug)
++		ast_debug(1, "UDPTL connection prepared for %s\n", token);
++
++	return 0;
++}
++
++int request_mode_change(unsigned call_reference, 
++			const char *token, 
++			struct t38_profile *profile)
++{
++	struct oh323_pvt *p = NULL;
++	int res = -1;
++
++	if(h323debug)
++		ast_debug(1, "Requesting mode change (%d) for %s\n", profile->ast.request_response, token);
++        
++	p = find_call_locked(call_reference, token);
++	if (!p) {
++		ast_log(LOG_ERROR, "Unable to find call %s(%d)\n", token, call_reference);
++		return -1;
++	}
++
++	if ((profile->ast.request_response == AST_T38_REQUEST_NEGOTIATE && p->t38state != T38_STATE_UNKNOWN) ||
++	    (profile->ast.request_response == AST_T38_REQUEST_TERMINATE && p->t38state != T38_STATE_NEGOTIATED && p->t38state != T38_STATE_NEGOTIATING) ||
++	    (profile->ast.request_response == AST_T38_NEGOTIATED && p->t38state != T38_STATE_NEGOTIATING) || 
++	    (profile->ast.request_response == AST_T38_TERMINATED && p->t38state != T38_STATE_NEGOTIATING) ||
++	    (profile->ast.request_response == AST_T38_REFUSED && p->t38state != T38_STATE_NEGOTIATING)) {
++		/* no need to pass this to bridged peer */
++		ast_log(LOG_ERROR, "Wrong request/response %d received in state %d for call %s(%d)\n", profile->ast.request_response, p->t38state, token, call_reference);
++		ast_mutex_unlock(&p->lock);
++		return -1;
++	}
++	    
++	if (profile->ast.request_response == AST_T38_REQUEST_NEGOTIATE || 
++	    profile->ast.request_response == AST_T38_NEGOTIATED) {
++		unsigned max_datagram = profile->max_datagram;
++		if (max_datagram < p->options.t38pt_udptl_max_datagram)
++			max_datagram = p->options.t38pt_udptl_max_datagram;
++
++		if (!p->udptl) {
++			/* Strange, if we accept T.38 mode change - it means we have provided T.38 capability
++			 * and UDPTL should be created
++			 */ 
++			ast_log(LOG_ERROR, "No UDPTL for call %s(%d)\n", token, call_reference);
++    			ast_mutex_unlock(&p->lock);
++			return -1;
++		}
++
++		ast_udptl_set_far_max_datagram(p->udptl, max_datagram);
++		ast_udptl_set_error_correction_scheme(p->udptl, profile->error_correction_scheme);
++		profile->ast.max_ifp = ast_udptl_get_far_max_ifp(p->udptl);
++        }
++
++        if (p->owner) {
++                while (p->owner && ast_channel_trylock(p->owner)) {
++                        ast_debug(1,"Failed to grab lock, trying again\n");
++                        DEADLOCK_AVOIDANCE(&p->lock);
++                }
++                if (!p->owner) {
++			ast_log(LOG_ERROR, "No owner for call %s(%d)\n", token, call_reference);
++    			ast_mutex_unlock(&p->lock);
++			return -1;
++		}
++        } else {
++		ast_log(LOG_ERROR, "No owner for call %s(%d)\n", token, call_reference);
++		ast_mutex_unlock(&p->lock);
++		return -1;
++	}
++
++	res = ast_queue_control_data(p->owner, AST_CONTROL_T38_PARAMETERS, &profile->ast, sizeof(profile->ast));
++	if (res == 0) {
++		switch (profile->ast.request_response) {
++		case AST_T38_REQUEST_NEGOTIATE:
++		case AST_T38_REQUEST_TERMINATE:
++			p->t38state = T38_STATE_NEGOTIATING;
++			break;
++		case AST_T38_TERMINATED:
++		case AST_T38_REFUSED:
++			p->t38state = T38_STATE_UNKNOWN;
++			break;
++		case AST_T38_NEGOTIATED:
++			/* T.38 channel has been started in openh323 */
++			p->t38state = T38_STATE_NEGOTIATED;
++			break;
++		default:
++			break;
++		}
++	}
++
++	ast_channel_unlock(p->owner);
++	ast_mutex_unlock(&p->lock);
++
++	if(h323debug)
++		ast_debug(1, "Request mode change %s for %s\n", res ? "failed" : "done", token);
++
++	return res;
++}
++
+ /*! \brief
+   *	Call-back function to signal asterisk that the channel has been answered
+   * Returns nothing
+@@ -2482,6 +2864,11 @@
+ 		ast_rtp_instance_destroy(pvt->rtp);
+ 		pvt->rtp = NULL;
+ 	}
++	if (pvt->udptl) {
++		/* Immediately stop UDPTL (d.kochmashev@gmail.com) */
++		ast_udptl_destroy(pvt->udptl);
++		pvt->udptl = NULL;
++	}
+ 	/* Free dsp used for in-band DTMF detection */
+ 	if (pvt->vad) {
+ 		ast_dsp_free(pvt->vad);
+@@ -2549,16 +2936,17 @@
+ 		ast_debug(1, "DTMF payload on %s set to %d\n", token, payload);
+ }
+ 
+-static void set_peer_capabilities(unsigned call_reference, const char *token, int capabilities, struct ast_codec_pref *prefs)
++int set_peer_capabilities(unsigned call_reference, const char *token, int capabilities, struct ast_codec_pref *prefs, const struct t38_profile *t38profile)
+ {
+ 	struct oh323_pvt *pvt;
+-
++	int res = -1;
++	
+ 	if (h323debug)
+ 		ast_debug(1, "Got remote capabilities from connection %s\n", token);
+ 
+ 	pvt = find_call_locked(call_reference, token);
+ 	if (!pvt)
+-		return;
++		return -1;
+ 	pvt->peercapability = capabilities;
+ 	pvt->jointcapability = pvt->options.capability & capabilities;
+ 	if (prefs) {
+@@ -2581,7 +2969,32 @@
+ 			}
+ 		}
+ 	}
++
++	/* UDPTL can be not created yet (when servicing incoming call) */
++	if (pvt->options.t38pt_udptl && __oh323_udptl_create(pvt)) {
++		ast_log(LOG_ERROR, "Unable to create UDPTL for call %s(%d)\n", token, call_reference);
++		goto ERROR;
++	}
++
++	if (t38profile && pvt->udptl) {
++		unsigned max_datagram = t38profile->max_datagram;
++		if (max_datagram < pvt->options.t38pt_udptl_max_datagram)
++			max_datagram = pvt->options.t38pt_udptl_max_datagram;
++
++		if (pvt->options.t38pt_udptl_ec == UDPTL_EC_AUTO)
++			/* Use peer's options. We support all EC schemes, so in "auto" mode we take
++		         * what peer suggests us. Then we have more chances that he won't reject
++		         * RequestMode message from us when/if we will trigger T.38 mode switch.
++		         */
++			ast_udptl_set_error_correction_scheme(pvt->udptl, t38profile->error_correction_scheme);
++		ast_udptl_set_far_max_datagram(pvt->udptl, max_datagram);
++	}
++
++	res = 0;
++ERROR:
+ 	ast_mutex_unlock(&pvt->lock);
++
++	return res;
+ }
+ 
+ static void set_local_capabilities(unsigned call_reference, const char *token)
+@@ -2589,19 +3002,39 @@
+ 	struct oh323_pvt *pvt;
+ 	int capability, dtmfmode, pref_codec;
+ 	struct ast_codec_pref prefs;
++	struct t38_profile t38profile;
++	int t38 = 0;
+ 
+ 	if (h323debug)
+ 		ast_debug(1, "Setting capabilities for connection %s\n", token);
+ 
+ 	pvt = find_call_locked(call_reference, token);
+-	if (!pvt)
++	if (!pvt) {
++		ast_log(LOG_ERROR, "Unable to find call %s(%d)\n", token, call_reference);
+ 		return;
++	}
+ 	capability = (pvt->jointcapability) ? pvt->jointcapability : pvt->options.capability;
+ 	dtmfmode = pvt->options.dtmfmode;
+ 	prefs = pvt->options.prefs;
+ 	pref_codec = pvt->pref_codec;
++
++	/* UDPTL can be not created yet (when servicing incoming call) */
++	if (pvt->options.t38pt_udptl && __oh323_udptl_create(pvt)) {
++		ast_log(LOG_ERROR, "Unable to create UDPTL for call %s(%d)\n", token, call_reference);
++		ast_mutex_unlock(&pvt->lock);
++		return;
++	}
++	if (pvt->udptl) {
++		/* indicate that we support T.38 */
++		memset(&t38profile, 0, sizeof(t38profile));
++		t38profile.ast.rate = AST_T38_RATE_14400;
++		t38profile.ast.rate_management = AST_T38_RATE_MANAGEMENT_LOCAL_TCF;
++		t38profile.error_correction_scheme = ast_udptl_get_error_correction_scheme(pvt->udptl);
++		t38 = 1;
++	}
++
+ 	ast_mutex_unlock(&pvt->lock);
+-	h323_set_capabilities(token, capability, dtmfmode, &prefs, pref_codec);
++	h323_set_capabilities(token, capability, dtmfmode, &prefs, pref_codec, t38 ? &t38profile : NULL);
+ 
+ 	if (h323debug) {
+ 		int i;
+@@ -3067,6 +3500,7 @@
+ 				ast_log(LOG_WARNING, "Invalid address: %s\n", v->value);
+ 			} else {
+ 				memcpy(&bindaddr.sin_addr, hp->h_addr, sizeof(bindaddr.sin_addr));
++				bindaddr.sin_family = AF_INET;
+ 			}
+ 		} else if (!strcasecmp(v->name, "tos")) {	/* Needs to be removed in next release */
+ 			ast_log(LOG_WARNING, "The \"tos\" setting is deprecated in this version of Asterisk. Please change to \"tos_audio\".\n");
+@@ -3254,7 +3688,7 @@
+ 	struct oh323_pvt *pvt;
+ 	enum ast_rtp_glue_result res = AST_RTP_GLUE_RESULT_LOCAL;
+ 
+-	if (!(pvt = (struct oh323_pvt *)ast_channel_tech_pvt(chan)))
++	if (!(pvt = (struct oh323_pvt *) ast_channel_tech_pvt(chan)))
+ 		return AST_RTP_GLUE_RESULT_FORBID;
+ 
+ 	ast_mutex_lock(&pvt->lock);
+@@ -3414,7 +3848,6 @@
+ 						set_dtmf_payload,
+ 						hangup_connection,
+ 						set_local_capabilities,
+-						set_peer_capabilities,
+ 						remote_hold);
+ 		/* start the h.323 listener */
+ 		if (h323_start_listener(h323_signalling_port, bindaddr)) {
+@@ -3524,7 +3957,7 @@
+ 	return 0;
+ }
+ 
+-AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_LOAD_ORDER, "The NuFone Network's OpenH323 Channel Driver",
++AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_LOAD_ORDER, "H.323+ channel driver",
+ 		.load = load_module,
+ 		.unload = unload_module,
+ 		.reload = reload,

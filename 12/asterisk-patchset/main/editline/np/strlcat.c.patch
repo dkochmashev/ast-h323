@@ -1,0 +1,10 @@
+--- asterisk/main/editline/np/strlcat.c.orig	2006-08-21 08:11:39.000000000 +0600
++++ asterisk/main/editline/np/strlcat.c	2014-03-17 15:16:58.769069626 +0600
+@@ -26,6 +26,7 @@
+  */
+ 
+ #include "config.h"
++#include "sys.h"
+ #if defined(LIBC_SCCS) && !defined(lint)
+ static char *rcsid = "$OpenBSD: strlcat.c,v 1.2 1999/06/17 16:28:58 millert Exp $";
+ #endif /* LIBC_SCCS and not lint */

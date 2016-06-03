@@ -1,0 +1,46 @@
+Index: include/h460/h46018_h225.h
+===================================================================
+RCS file: /cvsroot/h323plus/h323plus/include/h460/h46018_h225.h,v
+retrieving revision 1.29
+diff -u -r1.29 h46018_h225.h
+--- include/h460/h46018_h225.h	1 Feb 2013 03:19:36 -0000	1.29
++++ include/h460/h46018_h225.h	11 Feb 2013 10:20:49 -0000
+@@ -560,12 +560,13 @@
+ 
+ #ifdef H323_H46019M
+ 
++#ifdef H323_H46024A
+     /** Get Peer Address
+       */
+     virtual PBoolean GetPeerAddress(
+         PIPSocketAddressAndPort & addr    ///< Variable to receive hosts IP address and port.
+     );
+-
++#endif	// H323_H46024A
+ 
+     /** Get Multiplex Address
+       */
+Index: src/h460/h46018_h225.cxx
+===================================================================
+RCS file: /cvsroot/h323plus/h323plus/src/h460/h46018_h225.cxx,v
+retrieving revision 1.55
+diff -u -r1.55 h46018_h225.cxx
+--- src/h460/h46018_h225.cxx	1 Feb 2013 07:41:04 -0000	1.55
++++ src/h460/h46018_h225.cxx	11 Feb 2013 10:20:50 -0000
+@@ -1458,6 +1458,8 @@
+ }
+ #endif
+ 
++#ifdef H323_H46024A
++
+ #ifdef H323_H46019M
+ PBoolean H46019UDPSocket::GetPeerAddress(PIPSocketAddressAndPort & addr)
+ {
+@@ -1466,7 +1468,6 @@
+ }
+ #endif
+ 
+-#ifdef H323_H46024A
+ void H46019UDPSocket::SetProbeState(probe_state newstate)
+ {
+     PWaitAndSignal m(probeMutex);

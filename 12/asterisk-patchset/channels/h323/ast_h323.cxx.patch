@@ -1,0 +1,1138 @@
+--- asterisk/channels/h323/ast_h323.cxx.orig	2011-02-03 21:22:10.000000000 +0500
++++ asterisk/channels/h323/ast_h323.cxx	2014-03-17 16:19:18.888386473 +0600
+@@ -80,6 +80,7 @@
+ #include "asterisk/logger.h"
+ #include "asterisk/channel.h"
+ #include "asterisk/astobj.h"
++#include "asterisk/transcap.h"
+ #ifdef __cplusplus
+ }
+ #endif
+@@ -104,27 +105,17 @@
+  */
+ 
+ /* PWlib Required Components  */
+-#if VERSION(OPENH323_MAJOR, OPENH323_MINOR, OPENH323_BUILD) > VERSION(1,19,4)
+-#define MAJOR_VERSION 1
+-#define MINOR_VERSION 19
+-#define BUILD_TYPE    ReleaseCode
+-#define BUILD_NUMBER  6
+-#else
+-#define MAJOR_VERSION 1
++#define MAJOR_VERSION 2
+ #define MINOR_VERSION 0
+ #define BUILD_TYPE    ReleaseCode
+ #define BUILD_NUMBER  0
+-#endif
+  
+-const char *h323manufact = "The NuFone Networks";
+-const char *h323product  = "H.323 Channel Driver for Asterisk";
+- 
+-PDECLARE_PROCESS(MyProcess,PProcess,h323manufact,h323product,MAJOR_VERSION,MINOR_VERSION,BUILD_TYPE,BUILD_NUMBER)
+-static MyProcess localProcess;  // active for the life of the DLL
+-/* void MyProcess::Main()
+-{
+-}
+-*/
++const char *h323manufact = "Community modified";
++const char *h323product  = "H.323+ channel driver";
++
++PDECLARE_PROCESS(MyProcess,PLibraryProcess,h323manufact,h323product,MAJOR_VERSION,MINOR_VERSION,BUILD_TYPE,BUILD_NUMBER)
++static MyProcess *localProcess = NULL;
++
+ ////////////////////////////////////////////////
+ 
+ 
+@@ -142,26 +133,31 @@
+ static int _timerChangePipe[2];
+ #endif
+ 
+-static unsigned traceOptions = PTrace::Timestamp | PTrace::Thread | PTrace::FileAndLine;
++static unsigned traceOptions = PTrace::FileAndLine | PTrace::Blocks;
+ 
+ class PAsteriskLog : public PObject, public iostream {
+ 	PCLASSINFO(PAsteriskLog, PObject);
+ 
+-	public:
++public:
+ 	PAsteriskLog() : iostream(cout.rdbuf()) { init(&buffer); }
+ 	~PAsteriskLog() { flush(); }
+ 
+-	private:
++private:
+ 	PAsteriskLog(const PAsteriskLog &) : iostream(cout.rdbuf()) { }
+ 	PAsteriskLog & operator=(const PAsteriskLog &) { return *this; }
+ 
+ 	class Buffer : public streambuf {
+-		public:
++	public:
+ 		virtual int overflow(int=EOF);
+ 		virtual int underflow();
+ 		virtual int sync();
+ 		PString string;
++	private:
++		// ...for thread safety.
++		// d.kochmashev@gmail.com
++		PTimedMutex m_bufferMutex;
+ 	} buffer;
++
+ 	friend class Buffer;
+ };
+ 
+@@ -169,9 +165,12 @@
+ 
+ int PAsteriskLog::Buffer::overflow(int c)
+ {
++	m_bufferMutex.Wait();
++
+ 	if (pptr() >= epptr()) {
+ 		int ppos = pptr() - pbase();
+-		char *newptr = string.GetPointer(string.GetSize() + 2000);
++		string.SetSize(string.GetSize() + 4096);
++		char *newptr = string.GetPointer(string.GetSize() + 4096);
+ 		setp(newptr, newptr + string.GetSize() - 1);
+ 		pbump(ppos);
+ 	}
+@@ -179,6 +178,9 @@
+ 		*pptr() = (char)c;
+ 		pbump(1);
+ 	}
++
++	m_bufferMutex.Signal();
++
+ 	return 0;
+ }
+ 
+@@ -189,27 +191,18 @@
+ 
+ int PAsteriskLog::Buffer::sync()
+ {
+-	char *str = ast_strdup(string);
+-	char *s, *s1;
+-	char c;
++	m_bufferMutex.Wait();
+ 
+-	/* Pass each line with different ast_verbose() call */
+-	for (s = str; s && *s; s = s1) {
+-		s1 = strchr(s, '\n');
+-		if (!s1)
+-			s1 = s + strlen(s);
+-		else
+-			s1++;
+-		c = *s1;
+-		*s1 = '\0';
+-		ast_verbose("%s", s);
+-		*s1 = c;
+-	}
+-	ast_free(str);
++	PStringArray logStrings = string.Lines();
++	for (PINDEX i = 0; i < logStrings.GetSize(); i++)
++		ast_verbose("%s\n", logStrings[i].GetPointer());
+ 
+-	string = PString();
+-	char *base = string.GetPointer(2000);
++	string.MakeEmpty();
++	char *base = string.GetPointer();
+ 	setp(base, base + string.GetSize() - 1);
++
++	m_bufferMutex.Signal();
++
+ 	return 0;
+ }
+ 
+@@ -260,6 +253,10 @@
+ 
+ 	/* Reset call setup timeout to some more reasonable value than 1 minute */
+ 	signallingChannelCallTimeout = PTimeInterval(0, 0, 10);	/* 10 minutes */
++	
++	/* By default disable Round Trip Delay calculation procedure
++	   d.kochmashev@gmail.com */
++	roundTripDelayRate.SetInterval(0);
+ }
+ 
+ /** The fullAddress parameter is used directly in the MakeCall method so
+@@ -269,13 +266,11 @@
+   *					transport = ip.
+   *					port = 1720.
+   */
+-int MyH323EndPoint::MyMakeCall(const PString & dest, PString & token, void *_callReference, void *_opts)
++int MyH323EndPoint::MyMakeCall(const PString & dest, struct call_details *cd, struct call_options *opts)
+ {
+ 	PString fullAddress;
+ 	MyH323Connection * connection;
+ 	H323Transport *transport = NULL;
+-	unsigned int *callReference = (unsigned int *)_callReference;
+-	call_options_t *opts = (call_options_t *)_opts;
+ 
+ 	/* Determine whether we are using a gatekeeper or not. */
+ 	if (GetGatekeeper()) {
+@@ -306,18 +301,21 @@
+ 				cout << "Unable to get address and port" << endl;
+ 		}
+ 	}
++	PString token;
+ 	if (!(connection = (MyH323Connection *)H323EndPoint::MakeCallLocked(fullAddress, token, opts, transport))) {
+ 		if (h323debug) {
+ 			cout << "Error making call to \"" << fullAddress << '"' << endl;
+ 		}
+ 		return 1;
+ 	}
+-	*callReference = connection->GetCallReference();
++	connection->SetCallOptions(opts, false);
++	cd->call_reference = connection->GetCallReference();
++	memcpy(cd->call_token, (const unsigned char *)token, token.GetLength());
+ 
+ 	if (h323debug) {
+ 		cout << "\t-- " << GetLocalUserName() << " is calling host " << fullAddress << endl;
+ 		cout << "\t-- Call token is " << (const char *)token << endl;
+-		cout << "\t-- Call reference is " << *callReference << endl;
++		cout << "\t-- Call reference is " << cd->call_reference << endl;
+ #ifdef PTRACING
+ 		cout << "\t-- DTMF Payload is " << connection->dtmfCodec << endl;
+ #endif
+@@ -586,7 +584,13 @@
+ 	dtmfMode = 0;
+ 	dtmfCodec[0] = dtmfCodec[1] = (RTP_DataFrame::PayloadTypes)0;
+ 	redirect_reason = -1;
+-	transfer_capability = -1;
++
++	/* Initialise Bearer Capability IE parameters to Speech/1x64K/ITU-T standardized coding/Recommendations H.221 and H.242 ITU-T */
++	transferCapability = Q931::TransferSpeech;
++	transferRate = 1;
++	codingStandard = 0;
++	userInfoLayer1 = 5;
++
+ #ifdef TUNNELLING
+ 	tunnelOptions = remoteTunnelOptions = 0;
+ #endif
+@@ -604,6 +608,48 @@
+ 	return;
+ }
+ 
++/* Convert Asterisk transfer_capability to H323Plus Q931::InformationTransferCapability */
++Q931::InformationTransferCapability MyH323Connection::Q931InformationTransferCapability(unsigned short transfer_capability)
++{
++	switch(transfer_capability) {
++		case AST_TRANS_CAP_SPEECH :                           // 0x0	-> 0
++			return Q931::TransferSpeech;
++		case AST_TRANS_CAP_DIGITAL :                          // 0x08	-> 8
++			return Q931::TransferUnrestrictedDigital;
++		case AST_TRANS_CAP_RESTRICTED_DIGITAL :               // 0x09	-> 9
++			return Q931::TransferRestrictedDigital;
++		case AST_TRANS_CAP_3_1K_AUDIO :                       // 0x10	-> 16
++			return Q931::Transfer3_1kHzAudio;
++		case AST_TRANS_CAP_DIGITAL_W_TONES :                  // 0x11	-> 17
++			return Q931::TransferUnrestrictedDigitalWithTones;
++		case AST_TRANS_CAP_VIDEO :                            // 0x18	-> 24
++			return Q931::TransferVideo;
++		default :
++			return Q931::TransferSpeech;
++	}
++}
++
++/* Convert H323Plus Q931::InformationTransferCapability to Asterisk transfer_capability */
++unsigned short MyH323Connection::AstTransferCapability(Q931::InformationTransferCapability transfer_capability)
++{
++	switch(transfer_capability) {
++		case Q931::TransferSpeech :				// 0	-> 0x0
++			return AST_TRANS_CAP_SPEECH;
++		case Q931::TransferUnrestrictedDigital :		// 8	-> 0x08
++			return AST_TRANS_CAP_DIGITAL;
++		case Q931::TransferRestrictedDigital :			// 9	-> 0x09
++			return AST_TRANS_CAP_RESTRICTED_DIGITAL;
++		case Q931::Transfer3_1kHzAudio :			// 16	-> 0x10
++			return AST_TRANS_CAP_3_1K_AUDIO;
++		case Q931::TransferUnrestrictedDigitalWithTones :	// 17	-> 0x11
++			return AST_TRANS_CAP_DIGITAL_W_TONES;
++		case Q931::TransferVideo :				// 24	-> 0x18
++			return AST_TRANS_CAP_VIDEO;
++		default :
++			return AST_TRANS_CAP_SPEECH;
++	}
++}
++		
+ PBoolean MyH323Connection::OnReceivedProgress(const H323SignalPDU &pdu)
+ {
+ 	PBoolean isInband;
+@@ -769,9 +815,7 @@
+ 		}
+ 		cid_presentation = opts->presentation;
+ 		cid_ton = opts->type_of_number;
+-		if (opts->transfer_capability >= 0) {
+-			transfer_capability = opts->transfer_capability;
+-		}
++		transferCapability = MyH323Connection::Q931InformationTransferCapability(opts->transfer_capability);
+ 	}
+ 	tunnelOptions = opts->tunnelOptions;
+ }
+@@ -782,6 +826,7 @@
+ 	PString destE164;
+ 	PString sourceAliases;
+ 	PString destAliases;
++	const Q931& q931 = setupPDU.GetQ931();
+ 	char *s, *s1;
+ 	call_details_t *cd = (call_details_t *)callDetails;
+ 
+@@ -805,18 +850,16 @@
+ 		PString redirect_number;
+ 		unsigned redirect_reason;
+ 		unsigned plan, type, screening, presentation;
+-		Q931::InformationTransferCapability capability;
+-		unsigned transferRate, codingStandard, userInfoLayer1;
+ 
+ 		/* Fetch presentation and type information about calling party's number */
+-		if (setupPDU.GetQ931().GetCallingPartyNumber(sourceName, &plan, &type, &presentation, &screening, 0, 0)) {
++		if (q931.GetCallingPartyNumber(sourceName, &plan, &type, &presentation, &screening, 0, 0)) {
+ 			/* Construct fields back */
+ 			cd->type_of_number = (type << 4) | plan;
+ 			cd->presentation = (presentation << 5) | screening;
+ 		} else if (cd->call_source_e164[0]) {
+ 			cd->type_of_number = 0;		/* UNKNOWN */
+ 			cd->presentation = 0x03;	/* ALLOWED NETWORK NUMBER - Default */
+-			if (setupPDU.GetQ931().HasIE(Q931::UserUserIE)) {
++			if (q931.HasIE(Q931::UserUserIE)) {
+ 				const H225_Setup_UUIE &setup_uuie = setupPDU.m_h323_uu_pdu.m_h323_message_body;
+ 				if (setup_uuie.HasOptionalField(H225_Setup_UUIE::e_presentationIndicator))
+ 					cd->presentation = (cd->presentation & 0x9f) | (((unsigned int)setup_uuie.m_presentationIndicator.GetTag()) << 5);
+@@ -828,13 +871,13 @@
+ 			cd->presentation = 0x43;	/* NUMBER NOT AVAILABLE */
+ 		}
+ 
+-		sourceName = setupPDU.GetQ931().GetDisplayName();
++		sourceName = q931.GetDisplayName();
+ 		cd->call_source_name = strdup((const char *)sourceName);
+ 
+ 		GetSignallingChannel()->GetRemoteAddress().GetIpAndPort(Ip, sourcePort);
+ 		cd->sourceIp = strdup((const char *)Ip.AsString());
+ 
+-		if (setupPDU.GetQ931().GetRedirectingNumber(redirect_number, NULL, NULL, NULL, NULL, &redirect_reason, 0, 0, 0)) {
++		if (q931.GetRedirectingNumber(redirect_number, NULL, NULL, NULL, NULL, &redirect_reason, 0, 0, 0)) {
+ 			cd->redirect_number = strdup((const char *)redirect_number);
+ 			cd->redirect_reason = redirect_reason;
+ 		}
+@@ -842,10 +885,11 @@
+ 			cd->redirect_reason = -1;
+ 
+ 		/* Fetch Q.931's transfer capability */
+-		if (((Q931 &)setupPDU.GetQ931()).GetBearerCapabilities(capability, transferRate, &codingStandard, &userInfoLayer1))
+-			cd->transfer_capability = ((unsigned int)capability & 0x1f) | (codingStandard << 5);
+-		else
+-			cd->transfer_capability = 0x00;	/* ITU coding of Speech */
++		if (const_cast<Q931 &>(q931).GetBearerCapabilities(transferCapability, transferRate, &codingStandard, &userInfoLayer1)) {
++			cd->transfer_capability = AstTransferCapability(transferCapability);
++		} else {
++			cd->transfer_capability = AstTransferCapability(Q931::TransferSpeech);
++		}
+ 
+ 		/* Don't show local username as called party name */
+ 		SetDisplayName(cd->call_dest_e164);
+@@ -1274,11 +1318,10 @@
+ 		setupPDU.GetQ931().SetIE(Q931::RedirectingNumberIE, IE);
+ 	}
+ 
+-	if (transfer_capability)
+-		setupPDU.GetQ931().SetBearerCapabilities((Q931::InformationTransferCapability)(transfer_capability & 0x1f), 1, ((transfer_capability >> 5) & 3));
+-
+ 	SetCallDetails(&cd, setupPDU, FALSE);
+ 
++	setupPDU.GetQ931().SetBearerCapabilities(transferCapability, transferRate);
++
+ 	int res = on_outgoing_call(&cd);
+ 	if (!res) {
+ 		if (h323debug) {
+@@ -1694,7 +1737,6 @@
+ 			if (cap.GetTag() == H245_Capability::e_receiveRTPAudioTelephonyEventCapability) {
+ 				H245_AudioTelephonyEventCapability & atec = cap;
+ 				atec.m_dynamicRTPPayloadType = dtmfCodec[0];
+-//				on_set_rfc2833_payload(GetCallReference(), (const char *)GetCallToken(), (int)dtmfCodec[0]);
+ #ifdef PTRACING
+ 				if (h323debug) {
+ 					cout << "\t-- Receiving RFC2833 on payload " <<
+@@ -1752,6 +1794,7 @@
+ #endif
+ 	struct ast_codec_pref prefs;
+ 	RTP_DataFrame::PayloadTypes pt;
++	bool remoteEndpointSupportsRFC2833 = false;
+ 
+ 	if (!H323Connection::OnReceivedCapabilitySet(remoteCaps, muxCap, reject)) {
+ 		return FALSE;
+@@ -1759,6 +1802,7 @@
+ 
+ 	memset(&prefs, 0, sizeof(prefs));
+ 	int peer_capabilities = 0;
++	const AST_T38Capability* t38Cap = NULL;
+ 	for (int i = 0; i < remoteCapabilities.GetSize(); ++i) {
+ 		unsigned int subType = remoteCapabilities[i].GetSubType();
+ 		if (h323debug) {
+@@ -1789,7 +1833,10 @@
+ 			}
+ 			break;
+ 		case H323Capability::e_Data:
+-			if (!strcmp((const char *)remoteCapabilities[i].GetFormatName(), CISCO_DTMF_RELAY)) {
++			t38Cap = dynamic_cast<const AST_T38Capability*>(&remoteCapabilities[i]);
++			if (t38Cap)
++				break;
++			else if (!strcmp((const char *)remoteCapabilities[i].GetFormatName(), CISCO_DTMF_RELAY)) {
+ 				pt = remoteCapabilities[i].GetPayloadType();
+ 				if ((dtmfMode & H323_DTMF_CISCO) != 0) {
+ 					on_set_rfc2833_payload(GetCallReference(), (const char *)GetCallToken(), (int)pt, 1);
+@@ -1807,6 +1854,7 @@
+ 			if (!strcmp((const char *)remoteCapabilities[i].GetFormatName(), H323_UserInputCapability::SubTypeNames[H323_UserInputCapability::SignalToneRFC2833])) {
+ 				pt = remoteCapabilities[i].GetPayloadType();
+ 				if ((dtmfMode & H323_DTMF_RFC2833) != 0) {
++					remoteEndpointSupportsRFC2833 = true;
+ 					on_set_rfc2833_payload(GetCallReference(), (const char *)GetCallToken(), (int)pt, 0);
+ //					if (sendUserInputMode == SendUserInputAsTone)
+ //						sendUserInputMode = SendUserInputAsInlineRFC2833;
+@@ -1848,13 +1896,45 @@
+ 		}
+ 	}
+ 
++	// <ACM31DTMFBug>
++	if ((dtmfMode & H323_DTMF_RFC2833) != 0 && !remoteEndpointSupportsRFC2833)
++	{
++		// Avaya Communication Manager RFC2833 bug workaround.
++		// ACM, when set to use DTMF over IP: rtp-payload, doesn't include receiveRTPAudioTelephonyEventCapability in it's TCS.
++		// If chan_h323 detects ACM on the other side it will try to use DTMF transport as set in dtmfmode config option.
++		// d.kochmashev@gmail.com
++
++		const PStringArray rmtAppInfo = GetRemoteApplication().Tokenise("\t");
++		if (rmtAppInfo[0] == "Avaya Multivantage")
++		{
++			if (h323debug)
++				cout << "\t-- Avaya Communication Manager detected - " << 
++					"assuming RFC2833 NTE support with PT=" << (int)dtmfCodec[0] << endl;
++			on_set_rfc2833_payload(GetCallReference(), (const char *)GetCallToken(), (int)dtmfCodec[0], 0);
++		}
++	}
++	// </ACM31DTMFBug>
++
++	if (h323debug) {
++		char caps_str[1024], caps2_str[1024];
++		ast_codec_pref_string(&prefs, caps2_str, sizeof(caps2_str));
++		struct ast_format_cap *format_cap = ast_format_cap_alloc(AST_FORMAT_CAP_FLAG_NOLOCK);
++		if (format_cap != NULL) {
++			ast_format_cap_from_old_bitfield(format_cap, peer_capabilities);
++			cout << "Peer capabilities = " << ast_getformatname_multiple(caps_str, sizeof(caps_str), format_cap)
++				<< ", ordered list is " << caps2_str << endl;
++			ast_format_cap_destroy(format_cap);
++		}
++	}
+ #if 0
+ 	redir_capabilities &= peer_capabilities;
+ #endif
+-	if (on_setpeercapabilities)
+-		on_setpeercapabilities(GetCallReference(), (const char *)callToken, peer_capabilities, &prefs);
+ 
+-	return TRUE;
++	struct t38_profile t38profile;
++	if (t38Cap)
++		t38Cap->GetProfile(&t38profile);
++
++	return set_peer_capabilities(GetCallReference(), (const char *)callToken, peer_capabilities, &prefs, t38Cap ? &t38profile : NULL) == 0;
+ }
+ 
+ H323Channel * MyH323Connection::CreateRealTimeLogicalChannel(const H323Capability & capability,
+@@ -1866,8 +1946,18 @@
+ 	/* Do not open tx channel when transmitter has been paused by empty TCS */
+ 	if ((dir == H323Channel::IsTransmitter) && transmitterSidePaused)
+ 		return NULL;
++		
++	MyH323_ExternalRTPChannel *externalRtpChannel = NULL;
+ 
+-	return new MyH323_ExternalRTPChannel(*this, capability, dir, sessionID);
++	// Try to create MyH323_ExternalRTPChannel instance catching exceptions.
++	// d.kochmashev@gmail.com
++	try {
++		externalRtpChannel = new MyH323_ExternalRTPChannel(*this, capability, dir, sessionID);
++	} catch(MyH323_ExternalRTPChannel::RTPChannelCreationError) {
++		delete externalRtpChannel;
++		return NULL;
++	}
++	return externalRtpChannel;
+ }
+ 
+ /** This callback function is invoked once upon creation of each
+@@ -1878,6 +1968,10 @@
+ 	/* Increase the count of channels we have open */
+ 	channelsOpen++;
+ 
++	// Hack to make InternalEstablishedConnectionCheck not to automatically call OnSelectLogicalChannels
++	// d.kochmashev@gmail.com
++	earlyStart = FALSE;
++
+ 	if (h323debug) {
+ 		cout << "\t-- Started logical channel: "
+ 				<< ((channel.GetDirection() == H323Channel::IsTransmitter) ? "sending " : ((channel.GetDirection() == H323Channel::IsReceiver) ? "receiving " : " "))
+@@ -1887,7 +1981,7 @@
+ 	return connectionState != ShuttingDownConnection;
+ }
+ 
+-void MyH323Connection::SetCapabilities(int caps, int dtmf_mode, void *_prefs, int pref_codec)
++void MyH323Connection::SetCapabilities(int caps, int dtmf_mode, void *_prefs, int pref_codec, struct t38_profile *t38profile)
+ {
+ 	PINDEX lastcap = -1; /* last common capability index */
+ 	int alreadysent = 0;
+@@ -1978,6 +2072,9 @@
+ 		}
+ 	}
+ 
++	if (t38profile)
++		lastcap = localCapabilities.SetCapability(0, 0, new AST_T38Capability(t38profile));
++
+ 	cap = new H323_UserInputCapability(H323_UserInputCapability::HookFlashH245);
+ 	if (cap && cap->IsUsable(*this)) {
+ 		lastcap++;
+@@ -2070,6 +2167,22 @@
+ 		controlChannel = NULL;
+ 		return FALSE;
+ 	}
++
++	/* If remote endpoint is Avaya Communication Manager, delay openning H.245 channel
++	   via separate TCP connection for 1 second.
++	   d.kochmashev@gmail.com
++	*/
++	const PStringArray rmtAppInfo = GetRemoteApplication().Tokenise("\t");
++	if (rmtAppInfo[0] == "Avaya Multivantage")
++	{
++		if (h323debug) {
++			H323TransportAddress h245IpAddr(h245Address);
++			cout << "\t-- Avaya Communication Manager detected - " << 
++				"delaying TCP connection to h245Address (" << h245IpAddr << ") for 1 second" << endl;
++		}
++		PThread::Sleep(1000);
++	}
++
+ 	if (!controlChannel->Connect()) {
+ 		PTRACE(1, "H225\tConnect of H245 failed: " << controlChannel->GetErrorText());
+ 		delete controlChannel;
+@@ -2122,6 +2235,344 @@
+ #endif
+ }
+ 
++/* T.38 support */
++
++class MyT38Transport : public H323TransportIP
++{
++        PBoolean Connect()
++	{
++	        struct sockaddr_in them;
++		them.sin_family = AF_INET;
++		them.sin_addr.s_addr = remoteAddress;
++		them.sin_port = htons(remotePort);
++		return setup_udptl_connection(m_connection.GetCallReference(), 
++			    	    	      (const char *)m_connection.GetCallToken(),
++			    	              &them) == 0;
++	}
++
++	PBoolean Close()
++	{
++	        /* actual close is done in Asterisk */
++		return TRUE;
++	}
++    
++	PBoolean ReadPDU(PBYTEArray&)
++	{
++		return TRUE;
++	}
++
++	PBoolean ExtractPDU(const PBYTEArray&, PINDEX&)
++	{
++		return TRUE;
++	}
++
++	PBoolean WritePDU(const PBYTEArray&)
++	{
++		return TRUE;
++	}
++
++	PBoolean SetRemoteAddress(const H323TransportAddress& addr)
++	{
++		return addr.GetIpAndPort(remoteAddress, remotePort, "udp");
++	}
++
++	const H323Connection& m_connection;
++
++public:
++	MyT38Transport(const H323Connection& connection) : H323TransportIP(*endPoint, PIPSocket::Address("0.0.0.0"), 0),
++						    	   m_connection(connection)
++	{
++		struct rtp_info info;
++
++		PIPSocket::Address addr;
++		WORD port;
++		m_connection.GetSignallingChannel()->GetRemoteAddress().GetIpAndPort(addr, port);
++	
++		/* Determine the Local (A side) IP Address and port */
++		if(external_udptl_create(m_connection.GetCallReference(),
++		                         (const char *)m_connection.GetCallToken(),
++				         static_cast<in_addr>(addr),
++					 &info) == 0) {
++			localAddress = info.addr;
++			localPort = info.port;
++		}
++	}
++};
++
++struct MyT38Handler : public OpalT38Protocol
++{
++	MyT38Handler(const H323Connection& connection)
++	{
++		transport = new MyT38Transport(connection);
++		autoDeleteTransport = TRUE;
++	}
++};
++
++OpalT38Protocol * MyH323EndPoint::CreateT38ProtocolHandler(const H323Connection & connection) const
++{
++	return new MyT38Handler(connection);
++}
++
++MyT38Channel::MyT38Channel(H323Connection & connection,
++			   const H323Capability & capability,
++			   Directions direction,
++			   unsigned sessionID) : H323_T38Channel(connection,
++						                 capability,
++							         direction,
++							         sessionID,
++								 H323_T38Capability::e_UDP)
++{
++}
++
++PBoolean MyT38Channel::CreateListener()
++{
++	/* Don't create any listener - we don't need them.
++	 * Asterisk channel starts UDPTL listener.
++	 */
++	return TRUE;
++}
++
++H323Channel::Directions MyT38Channel::GetDirection() const
++{
++	/* This way we tell OpenH323 that we need openLogicalChannelAck
++	 * to start the channel
++	 */
++	return IsBidirectional;
++}
++
++void MyT38Channel::Receive() 
++{
++	/* do nothing - Asterisk handles all data */
++}
++
++void MyT38Channel::Transmit()
++{
++	/* do nothing - Asterisk handles all data */
++}
++
++PBoolean MyT38Channel::Start()
++{
++	if (receiver)
++		/* OpenH323 calls Start() for both the receiving and transmitting channel.
++		 * Both are of MyT38Channel type.
++		 * We start as soon as we can transmit data, because this means we know remote media address.
++		 * We do no actions for receiver to not to send AST_T38_NEGOTIATED twice.
++		 */
++		return TRUE;
++
++	const AST_T38Capability *t38Cap = NULL;
++	/* We need to choose whose capabilities to use to generate T.38 profile to send to bridged party.
++	 * 1) When we receive OLC from peer, T.38 profile is copied to local capability when OpenH323 calls OnReceivedPDU()
++	 * for local capability (in CreateLogicalChannel()). 
++	 * 2) When we send OLC, we put T.38 profile from local capability as well.
++	 * Therefore we should use T.38 profile from local capabilities. 
++	 * Note: T.38 profile at this stage possibly would be ignored by bridged party, because
++	 * it could have already applied profile sent by OnRequestModeChange()).
++	 */
++	for (PINDEX i = 0; i < connection.GetLocalCapabilities().GetSize(); i++) {
++		t38Cap = dynamic_cast<AST_T38Capability*>(&connection.GetLocalCapabilities()[i]);
++		if (t38Cap)
++			break;
++	}
++
++	if (!t38Cap) {
++		PTRACE(1, "T38\tNo capability found!");
++		return FALSE;
++	}
++
++	struct t38_profile profile;
++	t38Cap->GetProfile(&profile);
++	profile.ast.request_response = AST_T38_NEGOTIATED;
++
++	if (request_mode_change(connection.GetCallReference(), 
++    	        		(const char *)connection.GetCallToken(),
++				&profile) != 0) {
++		PTRACE(1, "T38\tfailed to ack mode switch!");
++		return FALSE;
++	}
++
++	/* Don't call parent's method - 
++	 * it starts threads which are not needed in this case
++	 */
++	return TRUE;
++}
++
++/* Remote side refused mode change initiated by us */
++void MyH323Connection::OnRefusedModeChange(const H245_RequestModeReject *pdu)
++{
++	if (t38ModeChangeCapabilities.IsEmpty())
++		/* remote side has refused change to audio mode */
++		return H323Connection::OnRefusedModeChange(pdu);
++
++	/* Remote side has refused change to T.38 mode.
++	 * We need to notify Asterisk in this case
++         * to prevent opposite call leg being stuck in T.38 negotiating state 
++         */
++	struct t38_profile profile;
++	profile.ast.request_response = AST_T38_REFUSED;
++	request_mode_change(GetCallReference(), 
++    		            (const char *)GetCallToken(),
++		            &profile);
++
++        return H323Connection::OnRefusedModeChange(pdu);
++}
++
++/* Remote side accepted mode change initiated by us */
++void MyH323Connection::OnAcceptModeChange(const H245_RequestModeAck & pdu)
++{
++	if (!t38ModeChangeCapabilities.IsEmpty())
++		/* remote side has accepted change to T.38 mode,
++		 * AST_T38_NEGOTIATED will be sent when T.38 channel
++		 * will be started
++		 */
++		return H323Connection::OnAcceptModeChange(pdu);
++
++	/* remote side has accepted change to audio mode */
++	struct t38_profile profile;
++	profile.ast.request_response = AST_T38_TERMINATED;
++
++	request_mode_change(GetCallReference(), 
++    	        	    (const char *)GetCallToken(),
++	  		    &profile);
++
++	CloseAllLogicalChannels(FALSE);
++	const H323Capability* capability = GetPreferredAudioCapability();
++	if (capability != NULL && OpenLogicalChannel(*capability,
++                                                     capability->GetDefaultSessionID(),
++                                                     H323Channel::IsTransmitter)) {
++    		PTRACE(1, "H245\tOpened " << *capability << " after audio mode change");
++    	}
++
++	return H323Connection::OnAcceptModeChange(pdu);
++}
++
++void MyH323Connection::OnModeChanged(PBoolean ok)
++{
++	m_modeChangedOk = ok;
++	m_modeChanged.Signal();
++}
++
++/* We accepted mode change request from remote side */
++PBoolean MyH323Connection::OnRequestModeChange(const H245_RequestMode & pdu,
++                                           H245_RequestModeAck & ack,
++                                           H245_RequestModeReject & reject,
++                                           PINDEX & selectedMode)
++{
++	bool genericAudio = false;
++	if (H323Connection::OnRequestModeChange(pdu, ack, reject, selectedMode) == FALSE) {
++		/* Hack to support H.323 stack from Objective Systems (and similar) on remote side.
++		 * OpenH323 was unable to find matching capability(es) on our side (in H323Connection::OnRequestModeChange()),
++		 * because remote side has sent us "generic" audio capability. This usually happens
++		 * on switch back to voice mode from T.38. Check if this is the case.
++		 */
++		for (selectedMode = 0; selectedMode < pdu.m_requestedModes.GetSize(); selectedMode++) {
++			for (PINDEX i = 0; i < pdu.m_requestedModes[selectedMode].GetSize(); i++) {
++				const H245_ModeElementType & modeElement = pdu.m_requestedModes[selectedMode][i].m_type;
++				if (modeElement.GetTag() == H245_ModeElementType::e_audioMode) {
++					const H245_AudioMode &audio = modeElement;
++					if (audio.GetTag() == H245_AudioCapability::e_genericAudioCapability)
++						genericAudio = true;
++				}
++			}
++		}
++
++		/* No matching capability and no generic audio, no luck */
++		if (!genericAudio) 
++			return FALSE;
++
++		const H323Capability* cap = GetPreferredAudioCapability();
++		if (!cap)
++			/* "Generic" capability requested but unable to determine preferred capability */
++			return FALSE;
++
++		H245_ModeDescription description;
++		description.SetSize(1);
++		cap->OnSendingPDU(description[0]);
++		H245_ArrayOf_ModeDescription descriptions;
++		descriptions.SetSize(1);
++		descriptions[0] = description;
++		H245_RequestMode& p = const_cast<H245_RequestMode&>(pdu); /* XXX: we alter what is not supposed to be altered by OpenH323,
++									  * but I don't know any better way
++									  */
++		p.m_requestedModes = descriptions;
++		selectedMode = 0;
++	}
++
++	struct t38_profile profile;
++	H323Capability *localCap = NULL;
++	H245_ModeElement *mode = NULL;
++	const H245_ModeDescription & newMode = pdu.m_requestedModes[selectedMode];
++
++	/* Use first matching capability to understand if this is switch to T.38 fax or voice mode */
++	for (PINDEX i = 0; i < newMode.GetSize(); i++) {
++		mode = &newMode[i];
++		localCap = localCapabilities.FindCapability(*mode);
++		if (localCap)
++		        break;
++	}
++
++	if (!localCap)
++		return FALSE;
++
++	if (AST_T38Capability *t38Cap = dynamic_cast<AST_T38Capability *>(localCap)) {
++		/* inherit T.38 profile from peer's RequestMode message */
++		t38Cap->OnReceivedPDU(mode->m_type);
++		t38Cap->GetProfile(&profile);
++		profile.ast.request_response = AST_T38_REQUEST_NEGOTIATE;
++	} else
++		profile.ast.request_response = AST_T38_REQUEST_TERMINATE;
++
++	/* Check if bridged party supports changing mode
++	 * and reject negotiation with peer if not.
++	 * T.38 profile contains peer's requested mode.
++	 */
++	m_modeChangedOk = FALSE;
++	if (request_mode_change(GetCallReference(), 
++				(const char *)GetCallToken(),
++			        &profile))
++		return FALSE;
++	
++	if (profile.ast.request_response == AST_T38_REQUEST_NEGOTIATE) {
++		/* For switch to T.38 - wait until bridged peer rejects or acks
++		 * mode change, respond to our peer respectively. Otherwise (without wait)
++		 * we'll need to enable T.38 mode and then almost immediately switch back
++		 * to voice mode if peer rejects switch to T.38. The latter should be
++		 * better avoided, because it can happen right in the middle of T.38 OLC negotiations
++		 * and peer's equipment will likely go crazy after this.
++		 * Also when bridged peer acks us, we learn final T.38 capabilities and send them to
++		 * our peer.
++		 */
++		if(!m_modeChangeMutex.Wait(0)) 
++			/* likely locked by CleanUpOnCallEnd() */
++			return FALSE;
++		Unlock(); /* to make FindConnectionWithLock() work ok when disposition is received from bridged peer */
++		m_modeChanged.Wait(3000); /* wait 3 sec for disposition from bridged peer */
++		/* connection couldn't be deleted during wait, because it's protected by m_modeChangeMutex,
++		 * so we can lock it again
++		 */
++		Lock();
++		m_modeChangeMutex.Signal();
++	        return m_modeChangedOk;
++	}
++	
++	/* for switch to audio mode - immediately ack,
++	 * because bridged peer/application might not ack AST_T38_REQUEST_TERMINATE request 
++	 * with AST_T38_TERMINATED (just like app_fax acts)
++	 * XXX: review this part when app_fax is fixed
++	 */
++	return TRUE;
++}
++
++void MyH323Connection::CleanUpOnCallEnd()                                                                                                                                                                                                                                                
++{
++	m_modeChanged.Signal();
++	m_modeChangeMutex.Wait(); 
++	/* if we're here - we're not waiting for mode change */
++	H323Connection::CleanUpOnCallEnd();
++	m_modeChangeMutex.Signal(); 
++}
++
++/* end of T.38 support */
+ 
+ /* MyH323_ExternalRTPChannel */
+ MyH323_ExternalRTPChannel::MyH323_ExternalRTPChannel(MyH323Connection & connection,
+@@ -2136,7 +2587,11 @@
+ 	info = on_external_rtp_create(connection.GetCallReference(), (const char *)connection.GetCallToken());
+ 	if (!info) {
+ 		cout << "\tERROR: on_external_rtp_create failure" << endl;
+-		return;
++
++		// Raise an exception if channel creation failed.
++		// I don't see other way to indicate an error from MyH323_ExternalRTPChannel constructor.
++		// d.kochmashev@gmail.com
++		throw RTPChannelCreationError();
+ 	} else {
+ 		localIpAddr = info->addr;
+ 		localPort = info->port;
+@@ -2160,29 +2615,33 @@
+ 
+ PBoolean MyH323_ExternalRTPChannel::Start(void)
+ {
++	if (isRunning)
++		return false;
++
+ 	/* Call ancestor first */
+-	if (!H323_ExternalRTPChannel::Start()) {
+-		return FALSE;
+-	}
++	if (!H323_ExternalRTPChannel::Start())
++		return false;
+ 
+-	if (h323debug) {
+-		cout << "\t\tExternal RTP Session Starting" << endl;
+-		cout << "\t\tRTP channel id " << sessionID << " parameters:" << endl;
+-	}
++	if (!static_cast<MyH323Connection &>(connection).IsFastStartDisabled()) {
++		if (h323debug) {
++			cout << "\t\tExternal RTP Session Starting" << endl;
++			cout << "\t\tRTP channel id " << sessionID << " parameters:" << endl;
++		}
+ 
+-	/* Collect the remote information */
+-	H323_ExternalRTPChannel::GetRemoteAddress(remoteIpAddr, remotePort);
++		/* Collect the remote information */
++		H323_ExternalRTPChannel::GetRemoteAddress(remoteIpAddr, remotePort);
+ 
+-	if (h323debug) {
+-		cout << "\t\t-- remoteIpAddress: " << remoteIpAddr << endl;
+-		cout << "\t\t-- remotePort: " << remotePort << endl;
+-		cout << "\t\t-- ExternalIpAddress: " << localIpAddr << endl;
+-		cout << "\t\t-- ExternalPort: " << localPort << endl;
++		if (h323debug) {
++			cout << "\t\t-- remoteIpAddress: " << remoteIpAddr << endl;
++			cout << "\t\t-- remotePort: " << remotePort << endl;
++			cout << "\t\t-- ExternalIpAddress: " << localIpAddr << endl;
++			cout << "\t\t-- ExternalPort: " << localPort << endl;
++		}
++		/* Notify Asterisk of remote RTP information */
++		on_start_rtp_channel(connection.GetCallReference(), (const char *)remoteIpAddr.AsString(),
++			remotePort, (const char *)connection.GetCallToken(), (int)payloadCode);
+ 	}
+-	/* Notify Asterisk of remote RTP information */
+-	on_start_rtp_channel(connection.GetCallReference(), (const char *)remoteIpAddr.AsString(), remotePort,
+-		(const char *)connection.GetCallToken(), (int)payloadCode);
+-	return TRUE;
++	return true;
+ }
+ 
+ PBoolean MyH323_ExternalRTPChannel::OnReceivedAckPDU(const H245_H2250LogicalChannelAckParameters & param)
+@@ -2250,6 +2709,9 @@
+ 
+ void h323_end_point_create(void)
+ {
++	// Create MyProcess instance, cause PDECLARE_PROCESS doesn't do this.
++	// d.kochmashev@gmail.com
++	localProcess = new MyProcess();
+ 	channelsOpen = 0;
+ 	logstream = new PAsteriskLog();
+ 	PTrace::SetStream(logstream); 
+@@ -2288,7 +2750,6 @@
+ 							rfc2833_cb				dtmffunc,
+ 							hangup_cb				hangupfunc,
+ 							setcapabilities_cb		capabilityfunc,
+-							setpeercapabilities_cb	peercapabilityfunc,
+ 							onhold_cb				holdfunc)
+ {
+ 	on_incoming_call = ifunc;
+@@ -2304,14 +2765,18 @@
+ 	on_set_rfc2833_payload = dtmffunc;
+ 	on_hangup = hangupfunc;
+ 	on_setcapabilities = capabilityfunc;
+-	on_setpeercapabilities = peercapabilityfunc;
+ 	on_hold = holdfunc;
+ }
+ 
+ /**
+  * Add capability to the capability table of the end point.
+  */
+-int h323_set_capabilities(const char *token, int cap, int dtmf_mode, struct ast_codec_pref *prefs, int pref_codec)
++int h323_set_capabilities(const char *token, 
++			  int cap, 
++			  int dtmf_mode, 
++			  struct ast_codec_pref *prefs, 
++			  int pref_codec,
++			  struct t38_profile *t38profile)
+ {
+ 	MyH323Connection *conn;
+ 
+@@ -2330,12 +2795,115 @@
+ 		cout << " ERROR: [h323_set_capabilities] Unable to find connection " << token << endl;
+ 		return 1;
+ 	}
+-	conn->SetCapabilities((/*conn->bridging ? conn->redir_capabilities :*/ cap), dtmf_mode, prefs, pref_codec);
++	conn->SetCapabilities((/*conn->bridging ? conn->redir_capabilities :*/ cap), dtmf_mode, prefs, pref_codec, t38profile);
+ 	conn->Unlock();
+ 
+ 	return 0;
+ }
+ 
++const H323Capability *MyH323Connection::GetPreferredAudioCapability() const
++{
++	const H323Capabilities& localCaps = GetLocalCapabilities();
++	const H323Capabilities& remoteCaps = GetRemoteCapabilities();
++	const H323Capability *remoteCapability = NULL;
++
++	/* Find first matching audio capability */
++	for (PINDEX i = 0; i < localCaps.GetSize(); i++) {
++		const H323Capability & localCapability = localCaps[i];
++		if(localCapability.GetMainType() != H323Capability::e_Audio)
++			continue;
++		remoteCapability = remoteCaps.FindCapability(localCapability);
++		if (remoteCapability)
++			break;
++	}
++
++	return remoteCapability;
++}
++
++int h323_request_mode_change(const char *token, const struct t38_profile *profile)
++{
++	if (!h323_end_point_exist()) {
++		cout << " ERROR: [h323_change_mode] No Endpoint, this is bad" << endl;
++		return -1;
++	}
++	if (!token || !*token) {
++		cout << " ERROR: [h323_change_mode] Invalid call token specified." << endl;
++		return -1;
++	}
++
++	PString myToken(token);
++	MyH323Connection *conn = (MyH323Connection *)endPoint->FindConnectionWithLock(myToken);
++	if (!conn) {
++		cout << " ERROR: [h323_change_mode_t38] Unable to find connection " << token << endl;
++		return -1;
++	}
++
++	PBoolean res = FALSE;
++	switch (profile->ast.request_response) {
++	case AST_T38_REQUEST_NEGOTIATE:
++	{
++		/* inherit T.38 capabilities */
++		const H323Capabilities& localCaps = conn->GetLocalCapabilities();
++		AST_T38Capability *t38Cap = NULL;
++		for (PINDEX i = 0; i < localCaps.GetSize(); i++) {
++			t38Cap = dynamic_cast<AST_T38Capability*>(&localCaps[i]);
++			if (t38Cap)
++				break;
++		}
++		/* We should definitely have T.38 capability
++		 * in case if Asterisk calls us this way
++		 */
++		t38Cap->SetProfile(profile);
++
++		res = conn->RequestModeChangeT38();
++		break;
++	}
++	case AST_T38_REQUEST_TERMINATE:
++		/* change mode to audio */
++		if (const H323Capability *remoteCapability = conn->GetPreferredAudioCapability()) {
++			if (h323debug)
++	    			cout << "ModeChange: " << remoteCapability->GetFormatName() << endl;
++			res = conn->RequestModeChange(remoteCapability->GetFormatName());
++		}
++		else if (h323debug)
++	    		cout << "ModeChange: no audio capability" << endl;
++		break;
++	case AST_T38_NEGOTIATED:
++	{
++		/* inherit T.38 capabilities */
++		const H323Capabilities& localCaps = conn->GetLocalCapabilities();
++		AST_T38Capability *t38Cap = NULL;
++		for (PINDEX i = 0; i < localCaps.GetSize(); i++) {
++			t38Cap = dynamic_cast<AST_T38Capability*>(&localCaps[i]);
++			if (t38Cap)
++				break;
++		}
++		/* We should definitely have T.38 capability
++		 * in case if Asterisk calls us this way
++		 */
++		t38Cap->SetProfile(profile);
++
++		conn->OnModeChanged(TRUE);
++		res = TRUE;
++		break;
++	}
++	case AST_T38_REFUSED:
++		conn->OnModeChanged(FALSE);
++		res = TRUE;
++		break;
++	case AST_T38_TERMINATED:
++		conn->OnModeChanged(TRUE);
++		res = TRUE;
++		break;
++	default:
++		break;
++	}
++	    
++	conn->Unlock();
++
++	return res == TRUE ? 0 : -1;
++}
++
+ /** Start the H.323 listener */
+ int h323_start_listener(int listenPort, struct sockaddr_in bindaddr)
+ {
+@@ -2364,13 +2932,13 @@
+ /* Addition of functions just to make the channel driver compile with H323Plus */
+ #if VERSION(OPENH323_MAJOR, OPENH323_MINOR, OPENH323_BUILD) > VERSION(1,19,4)
+ /* Alternate RTP port information for Same NAT */
+-BOOL MyH323_ExternalRTPChannel::OnReceivedAltPDU(const H245_ArrayOf_GenericInformation & alternate )
++PBoolean MyH323_ExternalRTPChannel::OnReceivedAltPDU(const H245_ArrayOf_GenericInformation & alternate )
+ {
+ 	return TRUE;
+ }
+ 
+ /* Alternate RTP port information for Same NAT */
+-BOOL MyH323_ExternalRTPChannel::OnSendingAltPDU(H245_ArrayOf_GenericInformation & alternate) const
++PBoolean MyH323_ExternalRTPChannel::OnSendingAltPDU(H245_ArrayOf_GenericInformation & alternate) const
+ {
+ 	return TRUE;
+ }
+@@ -2381,7 +2949,7 @@
+ }
+ 
+ /* Alternate RTP port information for Same NAT */
+-BOOL MyH323_ExternalRTPChannel::OnReceivedAckAltPDU(const H245_ArrayOf_GenericInformation & alternate)
++PBoolean MyH323_ExternalRTPChannel::OnReceivedAckAltPDU(const H245_ArrayOf_GenericInformation & alternate)
+ {
+ 	return TRUE;
+ }
+@@ -2507,7 +3075,6 @@
+   */
+ int h323_make_call(char *dest, call_details_t *cd, call_options_t *call_options)
+ {
+-	int res;
+ 	PString	token;
+ 	PString	host(dest);
+ 
+@@ -2515,9 +3082,7 @@
+ 		return 1;
+ 	}
+ 
+-	res = endPoint->MyMakeCall(host, token, &cd->call_reference, call_options);
+-	memcpy((char *)(cd->call_token), (const unsigned char *)token, token.GetLength());
+-	return res;
++	return endPoint->MyMakeCall(host, cd, call_options);
+ };
+ 
+ int h323_clear_call(const char *call_token, int cause)
+@@ -2659,7 +3224,7 @@
+ #undef endl
+ void h323_end_process(void)
+ {
+-	if (endPoint) {
++	if (endPoint != NULL) {
+ 		delete endPoint;
+ 		endPoint = NULL;
+ 	}
+@@ -2667,9 +3232,8 @@
+ 	close(_timerChangePipe[0]);
+ 	close(_timerChangePipe[1]);
+ #endif
+-	if (logstream) {
++	if (logstream != NULL) {
+ 		PTrace::SetStream(NULL);
+-		delete logstream;
+ 		logstream = NULL;
+ 	}
+ }

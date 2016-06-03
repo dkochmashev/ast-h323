@@ -1,0 +1,71 @@
+--- asterisk/autoconf/ast_check_h323plus.m4.orig	2013-07-24 14:26:53.000000000 +0600
++++ asterisk/autoconf/ast_check_h323plus.m4	2013-07-24 14:45:21.000000000 +0600
+@@ -0,0 +1,68 @@
++AC_DEFUN([AST_CHECK_H323PLUS], [
++	HAS_OPENH323=
++	PBX_OPENH323=
++	AC_LANG_PUSH([C++])
++	if test "${OPENH323DIR:-unset}" != "unset" ; then
++		AC_CHECK_HEADER(${OPENH323DIR}/version.h, HAS_OPENH323=1, )
++		AC_SUBST([H323_DIR],${OPENH323DIR})
++	else
++		if test "${H323PLUSDIR:-unset}" != "unset" ; then
++			AC_CHECK_HEADER(${H323PLUS3DIR}/version.h, HAS_OPENH323=1, )
++			AC_SUBST([H323_DIR],${H323PLUSDIR})
++		else
++			AC_MSG_RESULT([unavailable])
++			AC_ERROR([You need to define OPENH323DIR or H323PLUSDIR evironment variable])
++		fi
++	fi
++	AC_LANG_POP([C++])
++	if test "${HAS_OPENH323:-unset}" != "unset" -a -f "${H323_DIR}/openh323u.mak" -a -d "${H323_DIR}/lib"; then
++		AC_MSG_CHECKING([H323Plus installation])
++		PWLIBDIR=`grep "P[[WT]]LIBDIR[[[:space:]]]*=[[[:space:]]]*" "${H323_DIR}/openh323u.mak" | sed 's/^[[^=]]*=\s*//'`
++		if test -n "${PWLIBDIR}" ; then
++			PWLIB_OSTYPE_MACHTYPE=`${PWLIBDIR}/make/ptlib-config --ostype --machtype`
++			PWLIB_PLATFORM=`echo ${PWLIB_OSTYPE_MACHTYPE} | sed 's/ /_/g'`
++		else
++			AC_MSG_RESULT([unavailable])
++			AC_ERROR([Unable to find PTLib (was searching in '${PWLIBDIR}')])
++		fi
++
++		H323_LIB_SUFFIX=
++		H323_LIB_EXT=so
++		case "${OPENH323_DIR}" in
++			debug*)
++				H323_LIB_SUFFIX=_d
++			;;
++		esac
++		case "${OPENH323_DIR}" in
++			*noshared)
++				H323_LIB_SUFFIX="${H323_LIB_SUFFIX}_s"
++				H323_LIB_EXT=a
++			;;
++		esac
++
++		if test -n "${PWLIB_PLATFORM}" ; then
++			H323_LIB_FILE="libh323_${PWLIB_PLATFORM}_${H323_LIB_SUFFIX}.${H323_LIB_EXT}"
++			if test -f "${H323_DIR}/lib/${H323_LIB_FILE}" ; then
++				AC_DEFINE([HAVE_OPENH323], 1, [$3])
++				AC_SUBST([PWLIB_DIR],${PWLIBDIR})
++				AC_SUBST([PBX_OPENH323],1)
++			else
++				AC_MSG_RESULT([unavailable])
++				AC_ERROR([There is no H323Plus ${OPENH323_DIR} library file (${H323_LIB_FILE}) in ${H323_DIR}/lib])
++				AC_DEFINE([HAVE_OPENH323], 0, [$3])
++				unset H323_DIR
++			fi
++		else
++			AC_MSG_RESULT([unavailable])
++			AC_ERROR([Unable to determine PTLib platform type])
++			AC_DEFINE([HAVE_OPENH323], 0, [$3])
++			unset H323_DIR
++		fi
++		AC_MSG_RESULT([will use ${OPENH323_DIR} library for ${PWLIB_PLATFORM}])
++	else
++		AC_MSG_RESULT([unavailable])
++		AC_ERROR([Unable to find H323Plus])
++		AC_DEFINE([HAVE_OPENH323], 0, [$3])
++		unset H323_DIR
++	fi
++])

@@ -1,0 +1,239 @@
+--- asterisk/channels/h323/caps_h323.cxx.orig	2009-02-19 01:11:57.000000000 +0500
++++ asterisk/channels/h323/caps_h323.cxx	2013-03-14 16:32:12.000000000 +0600
+@@ -3,6 +3,7 @@
+ #include <h245.h>
+ #include "ast_h323.h"
+ #include "caps_h323.h"
++#include "chan_h323.h"
+ 
+ #define DEFINE_G711_CAPABILITY(cls, code, capName) \
+ class cls : public AST_G711Capability { \
+@@ -16,9 +17,9 @@
+ H323_REGISTER_CAPABILITY(AST_G7231Capability, OPAL_G7231);
+ H323_REGISTER_CAPABILITY(AST_G729Capability,  OPAL_G729);
+ H323_REGISTER_CAPABILITY(AST_G729ACapability, OPAL_G729A);
+-H323_REGISTER_CAPABILITY(AST_GSM0610Capability, OPAL_GSM0610);
+-H323_REGISTER_CAPABILITY(AST_CiscoG726Capability, CISCO_G726r32);
+-H323_REGISTER_CAPABILITY(AST_CiscoDtmfCapability, CISCO_DTMF_RELAY);
++//H323_REGISTER_CAPABILITY(AST_GSM0610Capability, OPAL_GSM0610);
++//H323_REGISTER_CAPABILITY(AST_CiscoG726Capability, CISCO_G726r32);
++//H323_REGISTER_CAPABILITY(AST_CiscoDtmfCapability, CISCO_DTMF_RELAY);
+ 
+ OPAL_MEDIA_FORMAT_DECLARE(OpalG711ALaw64kFormat,
+ 	OPAL_G711_ALAW_64K,
+@@ -80,6 +81,7 @@
+ 	240,	// 30 milliseconds
+ 	OpalMediaFormat::AudioTimeUnits,
+ 	0);
++/*
+ OPAL_MEDIA_FORMAT_DECLARE(OpalGSM0610Format,
+ 	OPAL_GSM0610,
+ 	OpalMediaFormat::DefaultAudioSessionID,
+@@ -112,6 +114,7 @@
+ 	OpalMediaFormat::AudioTimeUnits,
+ 	0);
+ #endif
++*/
+ 
+ /*
+  * Capability: G.711
+@@ -381,3 +384,199 @@
+ {
+ 	return PString(CISCO_DTMF_RELAY);
+ }
++
++/* Asterisk T.38 Capability */
++AST_T38Capability::AST_T38Capability(const struct t38_profile *profile) : H323_T38Capability(H323_T38Capability::e_UDP)
++{
++	SetProfile(profile);
++}
++
++PObject *AST_T38Capability::Clone() const
++{
++	return new AST_T38Capability(*this);
++}
++
++H323Channel *AST_T38Capability::CreateChannel(H323Connection &connection,
++				              H323Channel::Directions direction, unsigned sessionID,
++            				      const H245_H2250LogicalChannelParameters *param) const
++{
++	return new MyT38Channel(connection, *this, direction, sessionID);
++}
++
++void AST_T38Capability::SetProfile(const struct t38_profile* profile)
++{
++	m_profile.IncludeOptionalField(H245_T38FaxProfile::e_t38FaxUdpOptions);
++	m_profile.m_fillBitRemoval = profile->ast.fill_bit_removal;
++	m_profile.m_transcodingJBIG = profile->ast.transcoding_jbig;
++	m_profile.m_transcodingMMR = profile->ast.transcoding_mmr;
++	m_profile.m_version = profile->ast.version;
++
++	switch (profile->ast.rate_management) {
++	case AST_T38_RATE_MANAGEMENT_LOCAL_TCF:
++		m_profile.m_t38FaxRateManagement.SetTag(H245_T38FaxRateManagement::e_localTCF);
++		break;
++	case AST_T38_RATE_MANAGEMENT_TRANSFERRED_TCF:
++		m_profile.m_t38FaxRateManagement.SetTag(H245_T38FaxRateManagement::e_transferredTCF);
++		break;
++	default:
++		break;	
++	}
++
++	if (profile->max_datagram) {
++	        m_profile.m_t38FaxUdpOptions.IncludeOptionalField(H245_T38FaxUdpOptions::e_t38FaxMaxDatagram);
++		m_profile.m_t38FaxUdpOptions.m_t38FaxMaxDatagram = profile->max_datagram;
++	} else
++		m_profile.m_t38FaxUdpOptions.RemoveOptionalField(H245_T38FaxUdpOptions::e_t38FaxMaxDatagram);
++
++	switch (profile->error_correction_scheme) {
++	case UDPTL_ERROR_CORRECTION_REDUNDANCY:
++		m_profile.m_t38FaxUdpOptions.m_t38FaxUdpEC.SetTag(H245_T38FaxUdpOptions_t38FaxUdpEC::e_t38UDPRedundancy);
++		break;
++	case UDPTL_ERROR_CORRECTION_FEC:
++		m_profile.m_t38FaxUdpOptions.m_t38FaxUdpEC.SetTag(H245_T38FaxUdpOptions_t38FaxUdpEC::e_t38UDPFEC);
++		break;
++	default:
++		break;	
++	}
++
++	switch (profile->ast.rate) {
++	case AST_T38_RATE_2400:
++		m_bit_rate = 24;
++		break;
++	case AST_T38_RATE_4800:
++		m_bit_rate = 48;
++		break;
++        case AST_T38_RATE_7200:
++		m_bit_rate = 72;
++		break;
++	case AST_T38_RATE_9600:
++		m_bit_rate = 96;
++		break;
++        case AST_T38_RATE_12000:
++		m_bit_rate = 120;
++		break;
++        case AST_T38_RATE_14400:
++		m_bit_rate = 144;
++		break;
++	default:
++		break;
++	}
++}
++
++void AST_T38Capability::GetProfile(struct t38_profile* profile) const
++{
++	memset(profile, 0, sizeof(*profile));
++	
++	profile->ast.fill_bit_removal = m_profile.m_fillBitRemoval;
++	profile->ast.transcoding_jbig = m_profile.m_transcodingJBIG;
++	profile->ast.transcoding_mmr = m_profile.m_transcodingMMR;
++	profile->ast.version = m_profile.m_version;
++
++	switch (m_profile.m_t38FaxRateManagement.GetTag()) {
++	case H245_T38FaxRateManagement::e_localTCF:
++		profile->ast.rate_management = AST_T38_RATE_MANAGEMENT_LOCAL_TCF;
++		break;
++	case H245_T38FaxRateManagement::e_transferredTCF:
++		profile->ast.rate_management = AST_T38_RATE_MANAGEMENT_TRANSFERRED_TCF;
++		break;
++	default:
++		break;	
++	}
++
++	if (m_profile.m_t38FaxUdpOptions.HasOptionalField(H245_T38FaxUdpOptions::e_t38FaxMaxDatagram))
++		profile->max_datagram = m_profile.m_t38FaxUdpOptions.m_t38FaxMaxDatagram;
++
++	switch (m_profile.m_t38FaxUdpOptions.m_t38FaxUdpEC.GetTag()) {
++	case H245_T38FaxUdpOptions_t38FaxUdpEC::e_t38UDPRedundancy:
++		profile->error_correction_scheme = UDPTL_ERROR_CORRECTION_REDUNDANCY;
++		break;
++	case H245_T38FaxUdpOptions_t38FaxUdpEC::e_t38UDPFEC:
++		profile->error_correction_scheme = UDPTL_ERROR_CORRECTION_FEC;
++		break;
++	default:
++		break;	
++	}
++
++	switch (m_bit_rate) {
++	case 24:
++		profile->ast.rate = AST_T38_RATE_2400;
++		break;
++	case 48:
++		profile->ast.rate = AST_T38_RATE_4800;
++		break;
++        case 72:
++		profile->ast.rate = AST_T38_RATE_7200;
++		break;
++	case 96:
++		profile->ast.rate = AST_T38_RATE_9600;
++		break;
++        case 120:
++		profile->ast.rate = AST_T38_RATE_12000;
++		break;
++        case 144:
++		profile->ast.rate = AST_T38_RATE_14400;
++		break;
++	default:
++		break;
++	}
++}
++
++PBoolean AST_T38Capability::OnSendingPDU(H245_DataApplicationCapability & pdu) const
++{
++	PTRACE(3, "ASTH323T38\tOnSendingPDU for capability");
++
++	pdu.m_maxBitRate = m_bit_rate;
++	pdu.m_application.SetTag(H245_DataApplicationCapability_application::e_t38fax);
++	H245_DataApplicationCapability_application_t38fax & fax = pdu.m_application;
++	fax.m_t38FaxProtocol.SetTag(H245_DataProtocolCapability::e_udp);
++	fax.m_t38FaxProfile = m_profile;
++
++	return TRUE;
++}
++
++PBoolean AST_T38Capability::OnSendingPDU(H245_DataMode & pdu) const
++{
++	PTRACE(3, "ASTH323T38\tOnSendingPDU for capability");
++
++	pdu.m_bitRate = m_bit_rate;
++	pdu.m_application.SetTag(H245_DataMode_application::e_t38fax);
++	H245_DataMode_application_t38fax & fax = pdu.m_application;
++	fax.m_t38FaxProtocol.SetTag(H245_DataProtocolCapability::e_udp);
++	fax.m_t38FaxProfile = m_profile;
++
++	return TRUE;
++}
++
++PBoolean AST_T38Capability::OnReceivedPDU(const H245_DataApplicationCapability & pdu)
++{
++        if (pdu.m_application.GetTag() != H245_DataApplicationCapability_application::e_t38fax)
++		return FALSE;
++
++	const H245_DataApplicationCapability_application_t38fax & fax = pdu.m_application;
++	const H245_DataProtocolCapability & proto = fax.m_t38FaxProtocol;
++
++	if (proto.GetTag() != H245_DataProtocolCapability::e_udp)
++		return FALSE;
++
++	m_bit_rate = pdu.m_maxBitRate;
++	m_profile = fax.m_t38FaxProfile;
++
++	return TRUE;
++}
++
++PBoolean AST_T38Capability::OnReceivedPDU(const H245_DataMode & pdu)
++{
++        if (pdu.m_application.GetTag() != H245_DataApplicationCapability_application::e_t38fax)
++		return FALSE;
++
++	const H245_DataMode_application_t38fax & fax = pdu.m_application;
++	const H245_DataProtocolCapability & proto = fax.m_t38FaxProtocol;
++
++	if (proto.GetTag() != H245_DataProtocolCapability::e_udp)
++		return FALSE;
++
++	m_bit_rate = pdu.m_bitRate;
++	m_profile = fax.m_t38FaxProfile;
++
++	return TRUE;
++}

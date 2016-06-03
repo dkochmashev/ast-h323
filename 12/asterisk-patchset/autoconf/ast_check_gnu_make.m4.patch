@@ -1,0 +1,12 @@
+--- asterisk/autoconf/ast_check_gnu_make.m4.orig	2009-03-11 03:03:41.000000000 +0500
++++ asterisk/autoconf/ast_check_gnu_make.m4	2014-03-17 15:16:58.871063936 +0600
+@@ -16,5 +16,9 @@
+    AC_MSG_ERROR( *** Please install GNU make.  It is required to build Asterisk!)
+    exit 1
+ fi
++if test $((ac_cv_GNU_MAKE_VERSION_MAJOR*100 + ac_cv_GNU_MAKE_VERSION_MINOR)) -lt 382 ; then
++   AC_MSG_ERROR( *** GNU make version >= 3.82 is required to build Asterisk!)
++   exit 1
++fi
+ AC_SUBST([GNU_MAKE], [$ac_cv_GNU_MAKE])
+ ])

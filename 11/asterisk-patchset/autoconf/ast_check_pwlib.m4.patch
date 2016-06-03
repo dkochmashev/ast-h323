@@ -1,0 +1,11 @@
+--- ast_check_pwlib.m4.orig	2013-01-29 08:09:51.000000000 +0600
++++ ast_check_pwlib.m4	2011-05-04 13:13:18.000000000 +0600
+@@ -198,7 +198,7 @@
+ 	fi
+ 
+ 	if test "${HAS_$2:-unset}" != "unset"; then
+-		$2_VERSION=`grep "$VNAME \"" ${$2_INCDIR}/$3 | sed -e 's/[[[:space:]]]\{1,\}/ /g' | cut -f3 -d ' ' | sed -e 's/"//g'`
++		$2_VERSION=`grep "$VNAME" ${$2_INCDIR}/$3 | sed -e 's/[[[:space:]]]\{1,\}/ /g' | cut -f3 -d ' ' | sed -e 's/"//g'`
+ 		$2_MAJOR_VERSION=`echo ${$2_VERSION} | cut -f1 -d.`
+ 		$2_MINOR_VERSION=`echo ${$2_VERSION} | cut -f2 -d.`
+ 		$2_BUILD_NUMBER=`echo ${$2_VERSION} | cut -f3 -d.`
